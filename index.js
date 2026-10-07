@@ -7,6 +7,7 @@ import {
 } from "discord.js";
 import { commandsJSON } from "./commands.js";
 import { Player } from "discord-player";
+import ffmpegPath from "ffmpeg-static";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -25,24 +26,73 @@ const client = new Client({
   ]
 });
 
-const player = new Player(client);
+if (ffmpegPath) {
+  process.env.FFMPEG_PATH = ffmpegPath;
+  console.log(`FFmpeg configured: ${ffmpegPath}`);
+} else {
+  console.warn("ffmpeg-static did not provide an FFmpeg path.");
+}
+
+const player = new Player(client, {
+  skipFFmpeg: false
+});
 
 let musicReady = false;
 let musicInitError = "Music system has not initialized yet.";
 
-// Prevent Discord Player queue errors from becoming unhandled process errors.
-player.events.on("error", (queue, error) => {
-  console.error(
-    "Discord Player queue error:",
-    error?.message || String(error)
+const playbackWaiters = new Map();
+
+function resolvePlaybackWaiter(guildId, result) {
+  const waiter = playbackWaiters.get(guildId);
+  if (!waiter) return;
+
+  clearTimeout(waiter.timer);
+  playbackWaiters.delete(guildId);
+  waiter.resolve(result);
+}
+
+player.events.on("playerStart", (queue, track) => {
+  console.log(
+    `Playback started in ${queue.guild?.name || queue.guild?.id || "unknown guild"}: ${track.title}`
+  );
+
+  resolvePlaybackWaiter(queue.guild?.id, {
+    ok: true,
+    track
+  });
+});
+
+player.events.on("audioTrackAdd", (queue, track) => {
+  console.log(
+    `Track queued in ${queue.guild?.name || queue.guild?.id || "unknown guild"}: ${track.title}`
   );
 });
 
-player.events.on("playerError", (queue, error) => {
-  console.error(
-    "Discord Player playback error:",
-    error?.message || String(error)
+player.events.on("emptyQueue", queue => {
+  console.log(
+    `Music queue became empty in ${queue.guild?.name || queue.guild?.id || "unknown guild"}.`
   );
+});
+
+// Prevent Discord Player queue errors from becoming unhandled process errors.
+player.events.on("error", (queue, error) => {
+  const message = error?.message || String(error);
+  console.error("Discord Player queue error:", message);
+
+  resolvePlaybackWaiter(queue?.guild?.id, {
+    ok: false,
+    error: message
+  });
+});
+
+player.events.on("playerError", (queue, error) => {
+  const message = error?.message || String(error);
+  console.error("Discord Player playback error:", message);
+
+  resolvePlaybackWaiter(queue?.guild?.id, {
+    ok: false,
+    error: message
+  });
 });
 
 // ExtractorExecutionContext is also an EventEmitter.
@@ -678,22 +728,59 @@ client.on("interactionCreate", async interaction => {
             }
           });
 
+          const guildId = interaction.guild.id;
+
+          const playbackResult = await new Promise(resolve => {
+            const existing = playbackWaiters.get(guildId);
+            if (existing) {
+              clearTimeout(existing.timer);
+              playbackWaiters.delete(guildId);
+            }
+
+            const timer = setTimeout(() => {
+              playbackWaiters.delete(guildId);
+              resolve({
+                ok: false,
+                timeout: true,
+                error: "The track was queued, but Discord Player did not emit playerStart within 12 seconds."
+              });
+            }, 12000);
+
+            playbackWaiters.set(guildId, {
+              resolve,
+              timer
+            });
+          });
+
+          if (!playbackResult.ok) {
+            const detail = String(playbackResult.error || "Unknown voice playback error")
+              .replace(/`/g, "'")
+              .slice(0, 1200);
+
+            await interaction.editReply(
+              `⚠️ I found **${track.title}**, but voice playback did not start.\n\n**Voice error:** \`${detail}\``
+            );
+            break;
+          }
+
+          const startedTrack = playbackResult.track || track;
+
           const embed = new EmbedBuilder()
-            .setTitle("🎵 Added to Queue")
-            .setDescription(`[${track.title}](${track.url})`)
+            .setTitle("🎶 Now Playing")
+            .setDescription(`[${startedTrack.title}](${startedTrack.url})`)
             .addFields(
               {
                 name: "Artist / Uploader",
-                value: track.author || "Unknown",
+                value: startedTrack.author || "Unknown",
                 inline: true
               },
               {
                 name: "Duration",
-                value: track.duration || "Unknown",
+                value: startedTrack.duration || "Unknown",
                 inline: true
               }
             )
-            .setThumbnail(track.thumbnail || null)
+            .setThumbnail(startedTrack.thumbnail || null)
             .setFooter({
               text: `Requested by ${interaction.user.username}`
             });
