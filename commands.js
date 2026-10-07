@@ -140,6 +140,23 @@ export const commandBuilders = [
     .setDescription("Show all available commands."),
 
   new SlashCommandBuilder()
+    .setName("sticky")
+    .setDescription("Keep a message at the bottom of this channel.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+    .addStringOption(option =>
+      option
+        .setName("message")
+        .setDescription("The message to keep sticky.")
+        .setRequired(true)
+        .setMaxLength(1800)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("unsticky")
+    .setDescription("Remove the sticky message from this channel.")
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
+  new SlashCommandBuilder()
     .setName("clear")
     .setDescription("Delete recent messages.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
