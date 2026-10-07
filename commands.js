@@ -140,6 +140,17 @@ export const commandBuilders = [
     .setDescription("Show all available commands."),
 
   new SlashCommandBuilder()
+    .setName("play")
+    .setDescription("Play or queue a song in your voice channel.")
+    .addStringOption(option =>
+      option
+        .setName("query")
+        .setDescription("Song + artist, YouTube link, or Spotify link.")
+        .setRequired(true)
+        .setMaxLength(1000)
+    ),
+
+  new SlashCommandBuilder()
     .setName("sticky")
     .setDescription("Keep a compact embed message at the bottom of this channel.")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
