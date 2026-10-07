@@ -21,6 +21,8 @@ A basic Discord bot using `discord.js` with 21 slash commands.
 - `/uptime`
 - `/botinfo`
 - `/help`
+- `/sticky <message>`
+- `/unsticky`
 - `/clear <amount>`
 - `/kick <user> [reason]`
 - `/ban <user> [reason]`
@@ -145,3 +147,16 @@ Maximum timeout duration is 28 days.
 Never put your token directly inside `index.js`.
 
 If your token is ever exposed, reset it immediately in the Discord Developer Portal.
+
+
+## Sticky messages
+
+Use `/sticky <message>` to create or replace a sticky message in the current channel.
+
+Use `/unsticky` to remove it.
+
+Whenever a non-bot user sends a message, the bot briefly waits, deletes the old sticky,
+and reposts it at the bottom. Only members with **Manage Messages** can use these commands.
+
+Sticky configuration is stored in memory. If Railway restarts or redeploys the bot,
+run `/sticky` again in that channel.
