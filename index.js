@@ -713,7 +713,67 @@ client.on("interactionCreate", async interaction => {
         await interaction.deferReply();
 
         try {
-          const { track } = await player.play(voiceChannel, query, {
+          const guildId = interaction.guild.id;
+          const existingQueue = player.nodes.get(guildId);
+
+          const wasAlreadyPlaying =
+            Boolean(existingQueue?.node?.isPlaying?.()) ||
+            Boolean(existingQueue?.node?.isPaused?.());
+
+          // IMPORTANT:
+          // Register the waiter BEFORE player.play(). playerStart can fire
+          // during player.play(), so registering it afterward can miss the
+          // event and create a false timeout.
+          let playbackPromise = null;
+
+          if (!wasAlreadyPlaying) {
+            playbackPromise = new Promise(resolve => {
+              const existing = playbackWaiters.get(guildId);
+
+              if (existing) {
+                clearTimeout(existing.timer);
+                playbackWaiters.delete(guildId);
+              }
+
+              const timer = setTimeout(() => {
+                playbackWaiters.delete(guildId);
+
+                const queue = player.nodes.get(guildId);
+                const botVoiceChannel =
+                  interaction.guild.members.me?.voice?.channelId || "not connected";
+
+                const isPlaying =
+                  Boolean(queue?.node?.isPlaying?.());
+
+                const isPaused =
+                  Boolean(queue?.node?.isPaused?.());
+
+                const connectionStatus =
+                  queue?.connection?.state?.status ||
+                  queue?.connection?.state?.statusCode ||
+                  "unknown";
+
+                resolve({
+                  ok: false,
+                  timeout: true,
+                  error:
+                    `No playerStart event within 12 seconds. ` +
+                    `Bot voice channel: ${botVoiceChannel}; ` +
+                    `requested channel: ${voiceChannel.id}; ` +
+                    `queue playing: ${isPlaying}; ` +
+                    `queue paused: ${isPaused}; ` +
+                    `connection status: ${connectionStatus}.`
+                });
+              }, 12000);
+
+              playbackWaiters.set(guildId, {
+                resolve,
+                timer
+              });
+            });
+          }
+
+          const { track, queue } = await player.play(voiceChannel, query, {
             nodeOptions: {
               metadata: {
                 textChannelId: interaction.channelId,
@@ -728,37 +788,43 @@ client.on("interactionCreate", async interaction => {
             }
           });
 
-          const guildId = interaction.guild.id;
-
-          const playbackResult = await new Promise(resolve => {
-            const existing = playbackWaiters.get(guildId);
-            if (existing) {
-              clearTimeout(existing.timer);
-              playbackWaiters.delete(guildId);
-            }
-
-            const timer = setTimeout(() => {
-              playbackWaiters.delete(guildId);
-              resolve({
-                ok: false,
-                timeout: true,
-                error: "The track was queued, but Discord Player did not emit playerStart within 12 seconds."
+          // If something was already playing, this request was added to the queue.
+          if (wasAlreadyPlaying) {
+            const embed = new EmbedBuilder()
+              .setTitle("🎵 Added to Queue")
+              .setDescription(`[${track.title}](${track.url})`)
+              .addFields(
+                {
+                  name: "Artist / Uploader",
+                  value: track.author || "Unknown",
+                  inline: true
+                },
+                {
+                  name: "Duration",
+                  value: track.duration || "Unknown",
+                  inline: true
+                }
+              )
+              .setThumbnail(track.thumbnail || null)
+              .setFooter({
+                text: `Requested by ${interaction.user.username}`
               });
-            }, 12000);
 
-            playbackWaiters.set(guildId, {
-              resolve,
-              timer
-            });
-          });
+            await interaction.editReply({ embeds: [embed] });
+            break;
+          }
+
+          // The waiter was created before player.play(), so playerStart cannot
+          // race past us now.
+          const playbackResult = await playbackPromise;
 
           if (!playbackResult.ok) {
             const detail = String(playbackResult.error || "Unknown voice playback error")
               .replace(/`/g, "'")
-              .slice(0, 1200);
+              .slice(0, 1500);
 
             await interaction.editReply(
-              `⚠️ I found **${track.title}**, but voice playback did not start.\n\n**Voice error:** \`${detail}\``
+              `⚠️ I found **${track.title}**, but voice playback did not start.\n\n**Voice diagnostics:** \`${detail}\``
             );
             break;
           }
