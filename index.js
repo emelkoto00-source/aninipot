@@ -83,10 +83,48 @@ async function initializeMusic() {
     }
 
     const youtubeiModule = await import("discord-player-youtubei");
+
+    function findYouTubeExtractor(root) {
+      const seen = new Set();
+
+      function walk(value, keyName = "", depth = 0) {
+        if (value == null || depth > 4) return null;
+
+        if (typeof value === "function") {
+          const combinedName = `${keyName} ${value.name || ""}`;
+
+          if (/youtube.*extractor|extractor.*youtube|youtubei/i.test(combinedName)) {
+            return value;
+          }
+
+          return null;
+        }
+
+        if (typeof value !== "object") return null;
+        if (seen.has(value)) return null;
+        seen.add(value);
+
+        for (const [key, child] of Object.entries(value)) {
+          const found = walk(child, key, depth + 1);
+          if (found) return found;
+        }
+
+        return null;
+      }
+
+      return walk(root);
+    }
+
     const YoutubeiExtractor =
       youtubeiModule.YoutubeiExtractor ??
+      youtubeiModule.YouTubeiExtractor ??
+      youtubeiModule.YoutubeExtractor ??
+      youtubeiModule.YouTubeExtractor ??
       youtubeiModule.default?.YoutubeiExtractor ??
-      youtubeiModule.default;
+      youtubeiModule.default?.YouTubeiExtractor ??
+      youtubeiModule.default?.YoutubeExtractor ??
+      youtubeiModule.default?.YouTubeExtractor ??
+      findYouTubeExtractor(youtubeiModule);
 
     const registry = player.extractors;
 
@@ -130,10 +168,22 @@ async function initializeMusic() {
     }
 
     if (typeof YoutubeiExtractor !== "function") {
+      const topLevelKeys = Object.keys(youtubeiModule).join(", ") || "(none)";
+      const defaultKeys =
+        youtubeiModule.default && typeof youtubeiModule.default === "object"
+          ? Object.keys(youtubeiModule.default).join(", ")
+          : "(default is not an object)";
+
       throw new Error(
-        "discord-player-youtubei did not export YoutubeiExtractor."
+        `Could not locate the YouTube extractor export. ` +
+        `Top-level exports: ${topLevelKeys}. ` +
+        `Default exports: ${defaultKeys}.`
       );
     }
+
+    console.log(
+      `YouTube extractor discovered: ${YoutubeiExtractor.name || "anonymous extractor"}`
+    );
 
     try {
       await registry.register(YoutubeiExtractor, {});
