@@ -8,18 +8,6 @@ import {
 import { commandsJSON } from "./commands.js";
 import { Player } from "discord-player";
 
-const extractorModule = await import("@discord-player/extractor");
-const extractorPackage = extractorModule.default ?? extractorModule;
-const DefaultExtractors =
-  extractorModule.DefaultExtractors ??
-  extractorPackage.DefaultExtractors;
-
-const youtubeiModule = await import("discord-player-youtubei");
-const YoutubeiExtractor =
-  youtubeiModule.YoutubeiExtractor ??
-  youtubeiModule.default?.YoutubeiExtractor ??
-  youtubeiModule.default;
-
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 
@@ -39,90 +27,144 @@ const client = new Client({
 
 const player = new Player(client);
 
-async function loadMusicExtractors() {
-  const registry = player.extractors;
+let musicReady = false;
+let musicInitError = "Music system has not initialized yet.";
 
-  if (typeof registry.register !== "function") {
-    throw new Error(
-      `This Discord Player build does not expose extractors.register(). Available methods: ${
-        Object.getOwnPropertyNames(Object.getPrototypeOf(registry)).join(", ")
-      }`
+// Prevent Discord Player queue errors from becoming unhandled process errors.
+player.events.on("error", (queue, error) => {
+  console.error(
+    "Discord Player queue error:",
+    error?.message || String(error)
+  );
+});
+
+player.events.on("playerError", (queue, error) => {
+  console.error(
+    "Discord Player playback error:",
+    error?.message || String(error)
+  );
+});
+
+// ExtractorExecutionContext is also an EventEmitter.
+// If it emits "error" without a listener, Node can terminate the process.
+if (typeof player.extractors?.on === "function") {
+  player.extractors.on("error", (...args) => {
+    const actualError =
+      args.find(value => value instanceof Error) ??
+      args.find(value => value?.message) ??
+      args.at(-1);
+
+    console.error(
+      "Music extractor error:",
+      actualError?.message || String(actualError || "Unknown extractor error")
     );
-  }
+  });
+}
 
-  let defaults = DefaultExtractors;
+async function initializeMusic() {
+  try {
+    const extractorModule = await import("@discord-player/extractor");
+    const extractorPackage = extractorModule.default ?? extractorModule;
 
-  if (!Array.isArray(defaults)) {
-    defaults = Object.entries({
-      ...extractorPackage,
-      ...extractorModule
-    })
-      .filter(([name, value]) =>
-        name.endsWith("Extractor") &&
-        name !== "YoutubeiExtractor" &&
-        typeof value === "function"
-      )
-      .map(([, value]) => value);
-  }
+    let defaults =
+      extractorModule.DefaultExtractors ??
+      extractorPackage.DefaultExtractors;
 
-  if (!defaults?.length) {
-    throw new Error(
-      `No default extractors were found. Extractor module keys: ${
-        Object.keys(extractorModule).join(", ")
-      }`
-    );
-  }
+    if (!Array.isArray(defaults)) {
+      defaults = Object.entries({
+        ...extractorPackage,
+        ...extractorModule
+      })
+        .filter(([name, value]) =>
+          name.endsWith("Extractor") &&
+          typeof value === "function"
+        )
+        .map(([, value]) => value);
+    }
 
-  let registered = 0;
+    const youtubeiModule = await import("discord-player-youtubei");
+    const YoutubeiExtractor =
+      youtubeiModule.YoutubeiExtractor ??
+      youtubeiModule.default?.YoutubeiExtractor ??
+      youtubeiModule.default;
 
-  for (const Extractor of defaults) {
+    const registry = player.extractors;
+
+    if (typeof registry.register !== "function") {
+      throw new Error(
+        `extractors.register() is unavailable. Methods: ${
+          Object.getOwnPropertyNames(Object.getPrototypeOf(registry)).join(", ")
+        }`
+      );
+    }
+
+    let registered = 0;
+    let failed = 0;
+
+    for (const Extractor of defaults || []) {
+      // Do not register the dedicated youtubei extractor through this list.
+      if (
+        !Extractor ||
+        typeof Extractor !== "function" ||
+        /youtubei/i.test(Extractor.name || "")
+      ) {
+        continue;
+      }
+
+      try {
+        await registry.register(Extractor, {});
+        registered++;
+      } catch (error) {
+        const message = String(error?.message || error);
+
+        if (/already|duplicate|registered/i.test(message)) {
+          continue;
+        }
+
+        failed++;
+        console.error(
+          `Default extractor ${Extractor?.name || "unknown"} failed:`,
+          message
+        );
+      }
+    }
+
+    if (typeof YoutubeiExtractor !== "function") {
+      throw new Error(
+        "discord-player-youtubei did not export YoutubeiExtractor."
+      );
+    }
+
     try {
-      await registry.register(Extractor, {});
+      await registry.register(YoutubeiExtractor, {});
       registered++;
     } catch (error) {
       const message = String(error?.message || error);
 
-      // Ignore only "already registered" style errors.
       if (!/already|duplicate|registered/i.test(message)) {
-        console.error(
-          `Could not register extractor ${Extractor?.name || "unknown"}:`,
-          error
-        );
+        throw new Error(`YouTube extractor failed: ${message}`);
       }
     }
-  }
 
-  if (typeof YoutubeiExtractor !== "function") {
-    throw new Error(
-      `discord-player-youtubei did not expose YoutubeiExtractor. Module keys: ${
-        Object.keys(youtubeiModule).join(", ")
-      }`
+    musicReady = true;
+    musicInitError = "";
+
+    console.log(
+      `Music system ready. Extractors registered: ${registered}; optional failures: ${failed}.`
     );
-  }
-
-  try {
-    await registry.register(YoutubeiExtractor, {});
-    registered++;
   } catch (error) {
-    const message = String(error?.message || error);
+    musicReady = false;
+    musicInitError = String(
+      error?.message ||
+      error?.cause?.message ||
+      error ||
+      "Unknown music initialization error"
+    ).slice(0, 1000);
 
-    if (!/already|duplicate|registered/i.test(message)) {
-      throw error;
-    }
+    // IMPORTANT: do not throw here. Keep the Discord bot online.
+    console.error("Music initialization failed:", musicInitError);
   }
-
-  console.log(`Music extractors ready. Registered/available: ${registered}+`);
 }
-
-await loadMusicExtractors();
-
-player.events.on("error", (queue, error) => {
-  console.error(`Discord Player queue error in ${queue?.guild?.name || "unknown guild"}:`, error);
-});
-
-player.events.on("playerError", (queue, error) => {
-  console.error(`Discord Player playback error in ${queue?.guild?.name || "unknown guild"}:`, error);
-});
 
 const jokes = [
   "Why did the computer go to therapy? It had too many unresolved issues.",
@@ -252,7 +294,11 @@ async function registerCommands() {
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Serving ${client.guilds.cache.size} server(s).`);
+
   await registerCommands();
+
+  // Music initialization is isolated so an extractor problem cannot crash bebot.
+  await initializeMusic();
 });
 
 client.on("interactionCreate", async interaction => {
@@ -516,6 +562,14 @@ client.on("interactionCreate", async interaction => {
         if (!interaction.guild) {
           await interaction.reply({
             content: "This command can only be used in a server.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        if (!musicReady) {
+          await interaction.reply({
+            content: `🎵 The music system is currently unavailable.\n\n**Music error:** \`${musicInitError.replace(/`/g, "'").slice(0, 1000)}\``,
             ephemeral: true
           });
           break;
