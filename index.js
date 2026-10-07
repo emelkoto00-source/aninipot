@@ -6,8 +6,19 @@ import {
   PermissionFlagsBits
 } from "discord.js";
 import { commandsJSON } from "./commands.js";
-import { Player } from "discord-player";
 import ffmpegPath from "ffmpeg-static";
+import { spawn } from "node:child_process";
+import {
+  joinVoiceChannel,
+  createAudioPlayer,
+  createAudioResource,
+  AudioPlayerStatus,
+  VoiceConnectionStatus,
+  NoSubscriberBehavior,
+  StreamType,
+  entersState,
+  getVoiceConnection
+} from "@discordjs/voice";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -33,237 +44,397 @@ if (ffmpegPath) {
   console.warn("ffmpeg-static did not provide an FFmpeg path.");
 }
 
-const player = new Player(client, {
-  skipFFmpeg: false
-});
+const musicSessions = new Map();
 
-let musicReady = false;
-let musicInitError = "Music system has not initialized yet.";
-
-const playbackWaiters = new Map();
-
-function resolvePlaybackWaiter(guildId, result) {
-  const waiter = playbackWaiters.get(guildId);
-  if (!waiter) return;
-
-  clearTimeout(waiter.timer);
-  playbackWaiters.delete(guildId);
-  waiter.resolve(result);
-}
-
-player.events.on("playerStart", (queue, track) => {
-  console.log(
-    `Playback started in ${queue.guild?.name || queue.guild?.id || "unknown guild"}: ${track.title}`
-  );
-
-  resolvePlaybackWaiter(queue.guild?.id, {
-    ok: true,
-    track
-  });
-});
-
-player.events.on("audioTrackAdd", (queue, track) => {
-  console.log(
-    `Track queued in ${queue.guild?.name || queue.guild?.id || "unknown guild"}: ${track.title}`
-  );
-});
-
-player.events.on("emptyQueue", queue => {
-  console.log(
-    `Music queue became empty in ${queue.guild?.name || queue.guild?.id || "unknown guild"}.`
-  );
-});
-
-// Prevent Discord Player queue errors from becoming unhandled process errors.
-player.events.on("error", (queue, error) => {
-  const message = error?.message || String(error);
-  console.error("Discord Player queue error:", message);
-
-  resolvePlaybackWaiter(queue?.guild?.id, {
-    ok: false,
-    error: message
-  });
-});
-
-player.events.on("playerError", (queue, error) => {
-  const message = error?.message || String(error);
-  console.error("Discord Player playback error:", message);
-
-  resolvePlaybackWaiter(queue?.guild?.id, {
-    ok: false,
-    error: message
-  });
-});
-
-// ExtractorExecutionContext is also an EventEmitter.
-// If it emits "error" without a listener, Node can terminate the process.
-if (typeof player.extractors?.on === "function") {
-  player.extractors.on("error", (...args) => {
-    const actualError =
-      args.find(value => value instanceof Error) ??
-      args.find(value => value?.message) ??
-      args.at(-1);
-
-    console.error(
-      "Music extractor error:",
-      actualError?.message || String(actualError || "Unknown extractor error")
-    );
-  });
-}
-
-async function initializeMusic() {
+function isYouTubeUrl(value) {
   try {
-    const extractorModule = await import("@discord-player/extractor");
-    const extractorPackage = extractorModule.default ?? extractorModule;
+    const url = new URL(value);
+    const host = url.hostname.toLowerCase();
 
-    let defaults =
-      extractorModule.DefaultExtractors ??
-      extractorPackage.DefaultExtractors;
-
-    if (!Array.isArray(defaults)) {
-      defaults = Object.entries({
-        ...extractorPackage,
-        ...extractorModule
-      })
-        .filter(([name, value]) =>
-          name.endsWith("Extractor") &&
-          typeof value === "function"
-        )
-        .map(([, value]) => value);
-    }
-
-    const youtubeiModule = await import("discord-player-youtubei");
-
-    function findYouTubeExtractor(root) {
-      const seen = new Set();
-
-      function walk(value, keyName = "", depth = 0) {
-        if (value == null || depth > 4) return null;
-
-        if (typeof value === "function") {
-          const combinedName = `${keyName} ${value.name || ""}`;
-
-          if (/youtube.*extractor|extractor.*youtube|youtubei/i.test(combinedName)) {
-            return value;
-          }
-
-          return null;
-        }
-
-        if (typeof value !== "object") return null;
-        if (seen.has(value)) return null;
-        seen.add(value);
-
-        for (const [key, child] of Object.entries(value)) {
-          const found = walk(child, key, depth + 1);
-          if (found) return found;
-        }
-
-        return null;
-      }
-
-      return walk(root);
-    }
-
-    const YoutubeiExtractor =
-      youtubeiModule.YoutubeiExtractor ??
-      youtubeiModule.YouTubeiExtractor ??
-      youtubeiModule.YoutubeExtractor ??
-      youtubeiModule.YouTubeExtractor ??
-      youtubeiModule.default?.YoutubeiExtractor ??
-      youtubeiModule.default?.YouTubeiExtractor ??
-      youtubeiModule.default?.YoutubeExtractor ??
-      youtubeiModule.default?.YouTubeExtractor ??
-      findYouTubeExtractor(youtubeiModule);
-
-    const registry = player.extractors;
-
-    if (typeof registry.register !== "function") {
-      throw new Error(
-        `extractors.register() is unavailable. Methods: ${
-          Object.getOwnPropertyNames(Object.getPrototypeOf(registry)).join(", ")
-        }`
-      );
-    }
-
-    let registered = 0;
-    let failed = 0;
-
-    for (const Extractor of defaults || []) {
-      // Do not register the dedicated youtubei extractor through this list.
-      if (
-        !Extractor ||
-        typeof Extractor !== "function" ||
-        /youtubei/i.test(Extractor.name || "")
-      ) {
-        continue;
-      }
-
-      try {
-        await registry.register(Extractor, {});
-        registered++;
-      } catch (error) {
-        const message = String(error?.message || error);
-
-        if (/already|duplicate|registered/i.test(message)) {
-          continue;
-        }
-
-        failed++;
-        console.error(
-          `Default extractor ${Extractor?.name || "unknown"} failed:`,
-          message
-        );
-      }
-    }
-
-    if (typeof YoutubeiExtractor !== "function") {
-      const topLevelKeys = Object.keys(youtubeiModule).join(", ") || "(none)";
-      const defaultKeys =
-        youtubeiModule.default && typeof youtubeiModule.default === "object"
-          ? Object.keys(youtubeiModule.default).join(", ")
-          : "(default is not an object)";
-
-      throw new Error(
-        `Could not locate the YouTube extractor export. ` +
-        `Top-level exports: ${topLevelKeys}. ` +
-        `Default exports: ${defaultKeys}.`
-      );
-    }
-
-    console.log(
-      `YouTube extractor discovered: ${YoutubeiExtractor.name || "anonymous extractor"}`
+    return (
+      host === "youtu.be" ||
+      host.endsWith("youtube.com") ||
+      host.endsWith("music.youtube.com")
     );
+  } catch {
+    return false;
+  }
+}
 
-    try {
-      await registry.register(YoutubeiExtractor, {});
-      registered++;
-    } catch (error) {
-      const message = String(error?.message || error);
+function isSpotifyUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.hostname.toLowerCase().endsWith("spotify.com");
+  } catch {
+    return false;
+  }
+}
 
-      if (!/already|duplicate|registered/i.test(message)) {
-        throw new Error(`YouTube extractor failed: ${message}`);
-      }
+async function loadYtdl() {
+  const mod = await import("@distube/ytdl-core");
+  return mod.default ?? mod;
+}
+
+async function loadYtSearch() {
+  const mod = await import("yt-search");
+  return mod.default ?? mod;
+}
+
+async function spotifyLinkToSearchQuery(url) {
+  const endpoint =
+    `https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`;
+
+  const response = await fetch(endpoint, {
+    headers: {
+      "User-Agent": "Mozilla/5.0"
     }
+  });
 
-    musicReady = true;
-    musicInitError = "";
+  if (!response.ok) {
+    throw new Error(
+      `Spotify metadata request failed with HTTP ${response.status}.`
+    );
+  }
 
-    console.log(
-      `Music system ready. Extractors registered: ${registered}; optional failures: ${failed}.`
+  const data = await response.json();
+
+  if (!data?.title) {
+    throw new Error("Spotify did not return a track title for that link.");
+  }
+
+  return `${data.title} official audio`;
+}
+
+async function resolveMusicQuery(query) {
+  const ytdl = await loadYtdl();
+
+  if (isYouTubeUrl(query)) {
+    const info = await ytdl.getInfo(query);
+    const details = info.videoDetails;
+
+    return {
+      title: details.title || "YouTube Track",
+      author: details.author?.name || details.ownerChannelName || "YouTube",
+      duration: details.lengthSeconds
+        ? formatDuration(Number(details.lengthSeconds) * 1000)
+        : "Unknown",
+      url: details.video_url || query,
+      thumbnail:
+        details.thumbnails?.at(-1)?.url ||
+        details.thumbnails?.[0]?.url ||
+        null
+    };
+  }
+
+  let searchQuery = query;
+
+  if (isSpotifyUrl(query)) {
+    searchQuery = await spotifyLinkToSearchQuery(query);
+  }
+
+  const ytSearch = await loadYtSearch();
+  const results = await ytSearch(searchQuery);
+  const video = results?.videos?.[0];
+
+  if (!video?.url) {
+    throw new Error(
+      "No matching YouTube result was found for that request."
+    );
+  }
+
+  return {
+    title: video.title || "YouTube Track",
+    author: video.author?.name || "YouTube",
+    duration: video.timestamp || "Unknown",
+    url: video.url,
+    thumbnail: video.thumbnail || null
+  };
+}
+
+function cleanupCurrentAudio(session) {
+  try {
+    session.sourceStream?.destroy?.();
+  } catch {}
+
+  try {
+    session.ffmpeg?.stdin?.destroy?.();
+  } catch {}
+
+  try {
+    session.ffmpeg?.kill?.("SIGKILL");
+  } catch {}
+
+  session.sourceStream = null;
+  session.ffmpeg = null;
+}
+
+async function ensureVoiceConnection(voiceChannel, session) {
+  let connection = getVoiceConnection(voiceChannel.guild.id);
+
+  if (
+    connection &&
+    connection.joinConfig.channelId !== voiceChannel.id
+  ) {
+    try {
+      connection.destroy();
+    } catch {}
+
+    connection = null;
+  }
+
+  if (!connection) {
+    connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: voiceChannel.guild.id,
+      adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+      selfDeaf: true,
+      selfMute: false
+    });
+  }
+
+  session.connection = connection;
+
+  try {
+    await entersState(
+      connection,
+      VoiceConnectionStatus.Ready,
+      30000
     );
   } catch (error) {
-    musicReady = false;
-    musicInitError = String(
-      error?.message ||
-      error?.cause?.message ||
-      error ||
-      "Unknown music initialization error"
-    ).slice(0, 1000);
+    const status =
+      connection?.state?.status ||
+      "unknown";
 
-    // IMPORTANT: do not throw here. Keep the Discord bot online.
-    console.error("Music initialization failed:", musicInitError);
+    throw new Error(
+      `Discord voice connection never became Ready. Current status: ${status}.`
+    );
   }
+
+  const subscription = connection.subscribe(session.audioPlayer);
+
+  if (!subscription) {
+    throw new Error(
+      "The voice connection could not subscribe to the audio player."
+    );
+  }
+
+  return connection;
+}
+
+async function streamTrack(session, track) {
+  cleanupCurrentAudio(session);
+
+  const ytdl = await loadYtdl();
+
+  const sourceStream = ytdl(track.url, {
+    filter: "audioonly",
+    quality: "highestaudio",
+    highWaterMark: 1 << 25
+  });
+
+  session.sourceStream = sourceStream;
+
+  sourceStream.on("error", error => {
+    console.error("YouTube stream error:", error?.message || error);
+  });
+
+  if (!ffmpegPath) {
+    throw new Error("FFmpeg binary is unavailable.");
+  }
+
+  const ffmpeg = spawn(
+    ffmpegPath,
+    [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", "pipe:0",
+      "-vn",
+      "-f", "s16le",
+      "-ar", "48000",
+      "-ac", "2",
+      "pipe:1"
+    ],
+    {
+      stdio: ["pipe", "pipe", "pipe"]
+    }
+  );
+
+  session.ffmpeg = ffmpeg;
+
+  let ffmpegErrorText = "";
+
+  ffmpeg.stderr.on("data", chunk => {
+    ffmpegErrorText += chunk.toString();
+    ffmpegErrorText = ffmpegErrorText.slice(-2000);
+  });
+
+  ffmpeg.on("error", error => {
+    console.error("FFmpeg process error:", error?.message || error);
+  });
+
+  sourceStream.pipe(ffmpeg.stdin);
+
+  const resource = createAudioResource(ffmpeg.stdout, {
+    inputType: StreamType.Raw,
+    metadata: track
+  });
+
+  session.audioPlayer.play(resource);
+
+  try {
+    await entersState(
+      session.audioPlayer,
+      AudioPlayerStatus.Playing,
+      20000
+    );
+  } catch {
+    const playerStatus =
+      session.audioPlayer?.state?.status ||
+      "unknown";
+
+    throw new Error(
+      `Audio player never reached Playing. ` +
+      `Player status: ${playerStatus}. ` +
+      (ffmpegErrorText
+        ? `FFmpeg: ${ffmpegErrorText.trim().slice(0, 900)}`
+        : "FFmpeg did not report an error.")
+    );
+  }
+}
+
+async function sendNowPlaying(session, track) {
+  if (!track.textChannelId) return;
+
+  try {
+    const channel = await client.channels.fetch(track.textChannelId);
+
+    if (!channel?.isTextBased()) return;
+
+    const embed = new EmbedBuilder()
+      .setTitle("🎶 Now Playing")
+      .setDescription(`[${track.title}](${track.url})`)
+      .addFields(
+        {
+          name: "Artist / Uploader",
+          value: track.author || "Unknown",
+          inline: true
+        },
+        {
+          name: "Duration",
+          value: track.duration || "Unknown",
+          inline: true
+        }
+      )
+      .setThumbnail(track.thumbnail || null);
+
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error(
+      "Could not send Now Playing message:",
+      error?.message || error
+    );
+  }
+}
+
+async function playNextInSession(session) {
+  if (session.starting) return;
+
+  const next = session.queue.shift();
+
+  if (!next) {
+    session.current = null;
+    cleanupCurrentAudio(session);
+    return;
+  }
+
+  session.starting = true;
+  session.current = next;
+
+  try {
+    await streamTrack(session, next);
+    console.log(`Playback started: ${next.title}`);
+
+    // For queued songs after the first one.
+    if (!next.suppressAutoAnnouncement) {
+      await sendNowPlaying(session, next);
+    }
+  } catch (error) {
+    console.error(
+      `Track playback failed (${next.title}):`,
+      error?.message || error
+    );
+
+    if (next.textChannelId) {
+      try {
+        const channel = await client.channels.fetch(next.textChannelId);
+
+        if (channel?.isTextBased()) {
+          await channel.send(
+            `❌ Could not play **${next.title}**: \`${String(
+              error?.message || error
+            ).replace(/`/g, "'").slice(0, 1000)}\``
+          );
+        }
+      } catch {}
+    }
+
+    session.current = null;
+
+    setTimeout(() => {
+      playNextInSession(session).catch(console.error);
+    }, 500);
+  } finally {
+    session.starting = false;
+  }
+}
+
+function getOrCreateMusicSession(guildId) {
+  let session = musicSessions.get(guildId);
+
+  if (session) return session;
+
+  const audioPlayer = createAudioPlayer({
+    behaviors: {
+      noSubscriber: NoSubscriberBehavior.Pause
+    }
+  });
+
+  session = {
+    guildId,
+    audioPlayer,
+    connection: null,
+    queue: [],
+    current: null,
+    starting: false,
+    sourceStream: null,
+    ffmpeg: null
+  };
+
+  audioPlayer.on(AudioPlayerStatus.Idle, () => {
+    cleanupCurrentAudio(session);
+    session.current = null;
+
+    setTimeout(() => {
+      playNextInSession(session).catch(console.error);
+    }, 250);
+  });
+
+  audioPlayer.on("error", error => {
+    console.error(
+      "Direct audio player error:",
+      error?.message || error
+    );
+
+    cleanupCurrentAudio(session);
+    session.current = null;
+
+    setTimeout(() => {
+      playNextInSession(session).catch(console.error);
+    }, 500);
+  });
+
+  musicSessions.set(guildId, session);
+  return session;
 }
 
 const jokes = [
@@ -394,11 +565,8 @@ async function registerCommands() {
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Serving ${client.guilds.cache.size} server(s).`);
-
   await registerCommands();
-
-  // Music initialization is isolated so an extractor problem cannot crash bebot.
-  await initializeMusic();
+  console.log("Direct Discord voice music engine ready.");
 });
 
 client.on("interactionCreate", async interaction => {
@@ -667,14 +835,6 @@ client.on("interactionCreate", async interaction => {
           break;
         }
 
-        if (!musicReady) {
-          await interaction.reply({
-            content: `🎵 The music system is currently unavailable.\n\n**Music error:** \`${musicInitError.replace(/`/g, "'").slice(0, 1000)}\``,
-            ephemeral: true
-          });
-          break;
-        }
-
         const member = await interaction.guild.members
           .fetch(interaction.user.id)
           .catch(() => null);
@@ -702,94 +862,40 @@ client.on("interactionCreate", async interaction => {
           !voicePermissions?.has(PermissionFlagsBits.Speak)
         ) {
           await interaction.reply({
-            content: "❌ I need **Connect** and **Speak** permission in your voice channel.",
+            content:
+              "❌ I need **Connect** and **Speak** permission in your voice channel.",
             ephemeral: true
           });
           break;
         }
 
-        const query = interaction.options.getString("query", true).trim();
+        const query =
+          interaction.options.getString("query", true).trim();
 
         await interaction.deferReply();
 
         try {
-          const guildId = interaction.guild.id;
-          const existingQueue = player.nodes.get(guildId);
+          const track = await resolveMusicQuery(query);
 
-          const wasAlreadyPlaying =
-            Boolean(existingQueue?.node?.isPlaying?.()) ||
-            Boolean(existingQueue?.node?.isPaused?.());
+          track.requestedBy = interaction.user.id;
+          track.requestedByName = interaction.user.username;
+          track.textChannelId = interaction.channelId;
 
-          // IMPORTANT:
-          // Register the waiter BEFORE player.play(). playerStart can fire
-          // during player.play(), so registering it afterward can miss the
-          // event and create a false timeout.
-          let playbackPromise = null;
+          const session = getOrCreateMusicSession(
+            interaction.guild.id
+          );
 
-          if (!wasAlreadyPlaying) {
-            playbackPromise = new Promise(resolve => {
-              const existing = playbackWaiters.get(guildId);
+          await ensureVoiceConnection(voiceChannel, session);
 
-              if (existing) {
-                clearTimeout(existing.timer);
-                playbackWaiters.delete(guildId);
-              }
+          const alreadyBusy =
+            session.current ||
+            session.starting ||
+            session.audioPlayer.state.status === AudioPlayerStatus.Playing ||
+            session.audioPlayer.state.status === AudioPlayerStatus.Paused;
 
-              const timer = setTimeout(() => {
-                playbackWaiters.delete(guildId);
+          if (alreadyBusy) {
+            session.queue.push(track);
 
-                const queue = player.nodes.get(guildId);
-                const botVoiceChannel =
-                  interaction.guild.members.me?.voice?.channelId || "not connected";
-
-                const isPlaying =
-                  Boolean(queue?.node?.isPlaying?.());
-
-                const isPaused =
-                  Boolean(queue?.node?.isPaused?.());
-
-                const connectionStatus =
-                  queue?.connection?.state?.status ||
-                  queue?.connection?.state?.statusCode ||
-                  "unknown";
-
-                resolve({
-                  ok: false,
-                  timeout: true,
-                  error:
-                    `No playerStart event within 12 seconds. ` +
-                    `Bot voice channel: ${botVoiceChannel}; ` +
-                    `requested channel: ${voiceChannel.id}; ` +
-                    `queue playing: ${isPlaying}; ` +
-                    `queue paused: ${isPaused}; ` +
-                    `connection status: ${connectionStatus}.`
-                });
-              }, 12000);
-
-              playbackWaiters.set(guildId, {
-                resolve,
-                timer
-              });
-            });
-          }
-
-          const { track, queue } = await player.play(voiceChannel, query, {
-            nodeOptions: {
-              metadata: {
-                textChannelId: interaction.channelId,
-                requestedBy: interaction.user.id
-              },
-              volume: 70,
-              selfDeaf: true,
-              leaveOnEmpty: true,
-              leaveOnEmptyCooldown: 300000,
-              leaveOnEnd: true,
-              leaveOnEndCooldown: 120000
-            }
-          });
-
-          // If something was already playing, this request was added to the queue.
-          if (wasAlreadyPlaying) {
             const embed = new EmbedBuilder()
               .setTitle("🎵 Added to Queue")
               .setDescription(`[${track.title}](${track.url})`)
@@ -803,6 +909,11 @@ client.on("interactionCreate", async interaction => {
                   name: "Duration",
                   value: track.duration || "Unknown",
                   inline: true
+                },
+                {
+                  name: "Queue Position",
+                  value: String(session.queue.length),
+                  inline: true
                 }
               )
               .setThumbnail(track.thumbnail || null)
@@ -814,60 +925,55 @@ client.on("interactionCreate", async interaction => {
             break;
           }
 
-          // The waiter was created before player.play(), so playerStart cannot
-          // race past us now.
-          const playbackResult = await playbackPromise;
+          track.suppressAutoAnnouncement = true;
+          session.queue.push(track);
 
-          if (!playbackResult.ok) {
-            const detail = String(playbackResult.error || "Unknown voice playback error")
-              .replace(/`/g, "'")
-              .slice(0, 1500);
+          await playNextInSession(session);
 
-            await interaction.editReply(
-              `⚠️ I found **${track.title}**, but voice playback did not start.\n\n**Voice diagnostics:** \`${detail}\``
+          if (
+            session.audioPlayer.state.status !== AudioPlayerStatus.Playing
+          ) {
+            throw new Error(
+              `Playback setup finished but the audio player is ` +
+              `${session.audioPlayer.state.status}.`
             );
-            break;
           }
-
-          const startedTrack = playbackResult.track || track;
 
           const embed = new EmbedBuilder()
             .setTitle("🎶 Now Playing")
-            .setDescription(`[${startedTrack.title}](${startedTrack.url})`)
+            .setDescription(`[${track.title}](${track.url})`)
             .addFields(
               {
                 name: "Artist / Uploader",
-                value: startedTrack.author || "Unknown",
+                value: track.author || "Unknown",
                 inline: true
               },
               {
                 name: "Duration",
-                value: startedTrack.duration || "Unknown",
+                value: track.duration || "Unknown",
                 inline: true
               }
             )
-            .setThumbnail(startedTrack.thumbnail || null)
+            .setThumbnail(track.thumbnail || null)
             .setFooter({
               text: `Requested by ${interaction.user.username}`
             });
 
           await interaction.editReply({ embeds: [embed] });
         } catch (error) {
-          console.error("Play command error:", error);
+          console.error("Direct /play error:", error);
 
-          const rawMessage = String(
+          const safeMessage = String(
             error?.message ||
             error?.cause?.message ||
             error ||
-            "Unknown playback error"
-          );
-
-          const safeMessage = rawMessage
+            "Unknown music error"
+          )
             .replace(/`/g, "'")
-            .slice(0, 1200);
+            .slice(0, 1500);
 
           await interaction.editReply(
-            `❌ I couldn't play that request.\n\n**Playback error:** \`${safeMessage}\`\n\nTry another song or link. If it still fails, send me this exact error text.`
+            `❌ I couldn't start playback.\n\n**Music error:** \`${safeMessage}\``
           );
         }
 
