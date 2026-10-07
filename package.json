@@ -9,18 +9,17 @@
     "deploy-commands": "node register-commands.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
-    "@discord-player/extractor": "^4.5.1",
     "@discordjs/voice": "latest",
-    "discord-player": "^6.7.1",
-    "discord-player-youtubei": "latest",
+    "@distube/ytdl-core": "latest",
+    "@snazzah/davey": "latest",
     "discord.js": "^14.19.3",
     "dotenv": "^16.5.0",
     "ffmpeg-static": "^5.2.0",
     "libsodium-wrappers": "latest",
     "opusscript": "latest",
-    "simple-ytdl-core": "latest"
+    "yt-search": "latest"
   }
 }
