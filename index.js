@@ -29,7 +29,37 @@ const client = new Client({
 
 const player = new Player(client);
 
-await player.extractors.loadMulti(DefaultExtractors);
+async function loadMusicExtractors() {
+  const registry = player.extractors;
+
+  if (typeof registry.loadMulti === "function") {
+    await registry.loadMulti(DefaultExtractors);
+    console.log("Music extractors loaded with loadMulti().");
+    return;
+  }
+
+  if (typeof registry.loadDefault === "function") {
+    await registry.loadDefault();
+    console.log("Music extractors loaded with loadDefault().");
+    return;
+  }
+
+  if (typeof registry.register === "function") {
+    for (const extractor of DefaultExtractors) {
+      await registry.register(extractor);
+    }
+    console.log("Music extractors loaded individually with register().");
+    return;
+  }
+
+  throw new Error(
+    `No compatible Discord Player extractor loader was found. Available methods: ${
+      Object.getOwnPropertyNames(Object.getPrototypeOf(registry)).join(", ")
+    }`
+  );
+}
+
+await loadMusicExtractors();
 
 player.events.on("error", (queue, error) => {
   console.error(`Discord Player queue error in ${queue?.guild?.name || "unknown guild"}:`, error);
