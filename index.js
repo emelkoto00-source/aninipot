@@ -6,6 +6,8 @@ import {
   PermissionFlagsBits
 } from "discord.js";
 import { commandsJSON } from "./commands.js";
+import { Player } from "discord-player";
+import { DefaultExtractors } from "@discord-player/extractor";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -19,8 +21,21 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates
   ]
+});
+
+const player = new Player(client);
+
+await player.extractors.loadMulti(DefaultExtractors);
+
+player.events.on("error", (queue, error) => {
+  console.error(`Discord Player queue error in ${queue?.guild?.name || "unknown guild"}:`, error);
+});
+
+player.events.on("playerError", (queue, error) => {
+  console.error(`Discord Player playback error in ${queue?.guild?.name || "unknown guild"}:`, error);
 });
 
 const jokes = [
@@ -393,6 +408,7 @@ client.on("interactionCreate", async interaction => {
           "`/uptime` — Show bot uptime",
           "`/botinfo` — Show bot information",
           "`/help` — Show this list",
+          "`/play <query>` — Play or queue a song, YouTube link, or Spotify link",
           "`/sticky <message>` — Moderator: keep a message at the bottom of the channel",
           "`/unsticky` — Moderator: remove the channel sticky",
           "`/clear <amount>` — Moderator: delete recent messages",
@@ -407,6 +423,100 @@ client.on("interactionCreate", async interaction => {
           .setFooter({ text: "Timeout examples: 10m, 2h, 1d" });
 
         await interaction.reply({ embeds: [embed] });
+        break;
+      }
+
+      case "play": {
+        if (!interaction.guild) {
+          await interaction.reply({
+            content: "This command can only be used in a server.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const member = await interaction.guild.members
+          .fetch(interaction.user.id)
+          .catch(() => null);
+
+        const voiceChannel = member?.voice?.channel;
+
+        if (!voiceChannel) {
+          await interaction.reply({
+            content: "🎧 Join a voice channel first, then use `/play`.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const botMember =
+          interaction.guild.members.me ||
+          await interaction.guild.members.fetchMe().catch(() => null);
+
+        const voicePermissions = botMember
+          ? voiceChannel.permissionsFor(botMember)
+          : null;
+
+        if (
+          !voicePermissions?.has(PermissionFlagsBits.Connect) ||
+          !voicePermissions?.has(PermissionFlagsBits.Speak)
+        ) {
+          await interaction.reply({
+            content: "❌ I need **Connect** and **Speak** permission in your voice channel.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const query = interaction.options.getString("query", true).trim();
+
+        await interaction.deferReply();
+
+        try {
+          const { track } = await player.play(voiceChannel, query, {
+            nodeOptions: {
+              metadata: {
+                textChannelId: interaction.channelId,
+                requestedBy: interaction.user.id
+              },
+              volume: 70,
+              selfDeaf: true,
+              leaveOnEmpty: true,
+              leaveOnEmptyCooldown: 300000,
+              leaveOnEnd: true,
+              leaveOnEndCooldown: 120000
+            }
+          });
+
+          const embed = new EmbedBuilder()
+            .setTitle("🎵 Added to Queue")
+            .setDescription(`[${track.title}](${track.url})`)
+            .addFields(
+              {
+                name: "Artist / Uploader",
+                value: track.author || "Unknown",
+                inline: true
+              },
+              {
+                name: "Duration",
+                value: track.duration || "Unknown",
+                inline: true
+              }
+            )
+            .setThumbnail(track.thumbnail || null)
+            .setFooter({
+              text: `Requested by ${interaction.user.username}`
+            });
+
+          await interaction.editReply({ embeds: [embed] });
+        } catch (error) {
+          console.error("Play command error:", error);
+
+          await interaction.editReply(
+            "❌ I couldn't find or play that track. Try a more specific `song title + artist`, a YouTube link, or a Spotify track link."
+          );
+        }
+
         break;
       }
 
