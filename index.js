@@ -18,7 +18,8 @@ if (!TOKEN) {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages
   ]
 });
 
@@ -57,6 +58,29 @@ const eightBallAnswers = [
   "My reply is no.",
   "Very doubtful."
 ];
+
+const stickies = new Map();
+const stickyTimers = new Map();
+
+async function sendStickyMessage(channel, content) {
+  return channel.send({
+    content: `📌 **Sticky Message**\n${content}`,
+    allowedMentions: { parse: [] }
+  });
+}
+
+async function deleteStickyMessage(channel, messageId) {
+  if (!messageId) return;
+
+  try {
+    const oldMessage = await channel.messages.fetch(messageId);
+    if (oldMessage) {
+      await oldMessage.delete();
+    }
+  } catch {
+    // The previous sticky may already have been deleted manually.
+  }
+}
 
 function randomItem(array) {
   return array[Math.floor(Math.random() * array.length)];
@@ -359,6 +383,8 @@ client.on("interactionCreate", async interaction => {
           "`/uptime` — Show bot uptime",
           "`/botinfo` — Show bot information",
           "`/help` — Show this list",
+          "`/sticky <message>` — Moderator: keep a message at the bottom of the channel",
+          "`/unsticky` — Moderator: remove the channel sticky",
           "`/clear <amount>` — Moderator: delete recent messages",
           "`/kick <user> [reason]` — Moderator: kick a member",
           "`/ban <user> [reason]` — Moderator: ban a member",
@@ -371,6 +397,82 @@ client.on("interactionCreate", async interaction => {
           .setFooter({ text: "Timeout examples: 10m, 2h, 1d" });
 
         await interaction.reply({ embeds: [embed] });
+        break;
+      }
+
+      case "sticky": {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+          await interaction.reply({
+            content: "You need the **Manage Messages** permission to use this command.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const channel = interaction.channel;
+        const stickyText = interaction.options.getString("message", true).trim();
+
+        if (!channel?.isTextBased() || !("send" in channel)) {
+          await interaction.reply({
+            content: "Sticky messages can only be used in a text channel.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const existing = stickies.get(channel.id);
+
+        if (existing?.messageId) {
+          await deleteStickyMessage(channel, existing.messageId);
+        }
+
+        const stickyMessage = await sendStickyMessage(channel, stickyText);
+
+        stickies.set(channel.id, {
+          content: stickyText,
+          messageId: stickyMessage.id
+        });
+
+        await interaction.reply({
+          content: "📌 Sticky message enabled for this channel.",
+          ephemeral: true
+        });
+        break;
+      }
+
+      case "unsticky": {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageMessages)) {
+          await interaction.reply({
+            content: "You need the **Manage Messages** permission to use this command.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const channel = interaction.channel;
+        const existing = stickies.get(channel.id);
+
+        if (!existing) {
+          await interaction.reply({
+            content: "There is no active sticky message in this channel.",
+            ephemeral: true
+          });
+          break;
+        }
+
+        const timer = stickyTimers.get(channel.id);
+        if (timer) {
+          clearTimeout(timer);
+          stickyTimers.delete(channel.id);
+        }
+
+        await deleteStickyMessage(channel, existing.messageId);
+        stickies.delete(channel.id);
+
+        await interaction.reply({
+          content: "✅ Sticky message removed from this channel.",
+          ephemeral: true
+        });
         break;
       }
 
@@ -526,6 +628,43 @@ client.on("interactionCreate", async interaction => {
       await interaction.reply(message).catch(() => {});
     }
   }
+});
+
+client.on("messageCreate", message => {
+  if (message.author.bot) return;
+
+  const sticky = stickies.get(message.channelId);
+  if (!sticky) return;
+
+  const existingTimer = stickyTimers.get(message.channelId);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+
+  const timer = setTimeout(async () => {
+    stickyTimers.delete(message.channelId);
+
+    const currentSticky = stickies.get(message.channelId);
+    if (!currentSticky) return;
+
+    try {
+      await deleteStickyMessage(message.channel, currentSticky.messageId);
+
+      const newSticky = await sendStickyMessage(
+        message.channel,
+        currentSticky.content
+      );
+
+      stickies.set(message.channelId, {
+        ...currentSticky,
+        messageId: newSticky.id
+      });
+    } catch (error) {
+      console.error(`Sticky message error in ${message.channelId}:`, error);
+    }
+  }, 1200);
+
+  stickyTimers.set(message.channelId, timer);
 });
 
 client.on("error", console.error);
