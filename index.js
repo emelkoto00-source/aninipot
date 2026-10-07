@@ -12,6 +12,7 @@ import {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
+  demuxProbe,
   AudioPlayerStatus,
   VoiceConnectionStatus,
   NoSubscriberBehavior,
@@ -227,55 +228,69 @@ async function streamTrack(session, track) {
   const ytdl = await loadYtdl();
 
   const sourceStream = ytdl(track.url, {
-    filter: "audioonly",
+    filter: format =>
+      format.hasAudio &&
+      !format.hasVideo &&
+      (
+        format.codecs?.includes("opus") ||
+        format.mimeType?.includes("webm") ||
+        format.mimeType?.includes("ogg")
+      ),
     quality: "highestaudio",
     highWaterMark: 1 << 25
   });
 
   session.sourceStream = sourceStream;
 
-  sourceStream.on("error", error => {
-    console.error("YouTube stream error:", error?.message || error);
+  let streamError = null;
+
+  sourceStream.once("error", error => {
+    streamError = error;
+    console.error(
+      "YouTube source stream error:",
+      error?.message || error
+    );
   });
 
-  if (!ffmpegPath) {
-    throw new Error("FFmpeg binary is unavailable.");
+  // Discord can play Opus/WebM/Ogg audio directly. Probe the stream so
+  // @discordjs/voice knows the correct input type and no FFmpeg
+  // transcoding is required.
+  let probed;
+
+  try {
+    probed = await Promise.race([
+      demuxProbe(sourceStream),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(
+            new Error(
+              "Timed out while waiting for YouTube audio data."
+            )
+          ),
+          15000
+        )
+      )
+    ]);
+  } catch (error) {
+    try {
+      sourceStream.destroy();
+    } catch {}
+
+    throw new Error(
+      streamError?.message ||
+      error?.message ||
+      "Could not probe the YouTube audio stream."
+    );
   }
 
-  const ffmpeg = spawn(
-    ffmpegPath,
-    [
-      "-hide_banner",
-      "-loglevel", "error",
-      "-i", "pipe:0",
-      "-vn",
-      "-f", "s16le",
-      "-ar", "48000",
-      "-ac", "2",
-      "pipe:1"
-    ],
-    {
-      stdio: ["pipe", "pipe", "pipe"]
-    }
-  );
+  if (!probed?.stream || !probed?.type) {
+    throw new Error(
+      "YouTube returned a stream, but its audio format could not be detected."
+    );
+  }
 
-  session.ffmpeg = ffmpeg;
-
-  let ffmpegErrorText = "";
-
-  ffmpeg.stderr.on("data", chunk => {
-    ffmpegErrorText += chunk.toString();
-    ffmpegErrorText = ffmpegErrorText.slice(-2000);
-  });
-
-  ffmpeg.on("error", error => {
-    console.error("FFmpeg process error:", error?.message || error);
-  });
-
-  sourceStream.pipe(ffmpeg.stdin);
-
-  const resource = createAudioResource(ffmpeg.stdout, {
-    inputType: StreamType.Raw,
+  const resource = createAudioResource(probed.stream, {
+    inputType: probed.type,
     metadata: track
   });
 
@@ -295,9 +310,7 @@ async function streamTrack(session, track) {
     throw new Error(
       `Audio player never reached Playing. ` +
       `Player status: ${playerStatus}. ` +
-      (ffmpegErrorText
-        ? `FFmpeg: ${ffmpegErrorText.trim().slice(0, 900)}`
-        : "FFmpeg did not report an error.")
+      `The YouTube stream was detected as ${String(probed.type)}.`
     );
   }
 }
@@ -566,7 +579,7 @@ client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Serving ${client.guilds.cache.size} server(s).`);
   await registerCommands();
-  console.log("Direct Discord voice music engine ready.");
+  console.log("Direct Discord voice music engine ready (native Opus/WebM streaming).");
 });
 
 client.on("interactionCreate", async interaction => {
