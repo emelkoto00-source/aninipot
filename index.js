@@ -7,8 +7,18 @@ import {
 } from "discord.js";
 import { commandsJSON } from "./commands.js";
 import { Player } from "discord-player";
-import extractorPackage from "@discord-player/extractor";
-const { DefaultExtractors } = extractorPackage;
+
+const extractorModule = await import("@discord-player/extractor");
+const extractorPackage = extractorModule.default ?? extractorModule;
+const DefaultExtractors =
+  extractorModule.DefaultExtractors ??
+  extractorPackage.DefaultExtractors;
+
+const youtubeiModule = await import("discord-player-youtubei");
+const YoutubeiExtractor =
+  youtubeiModule.YoutubeiExtractor ??
+  youtubeiModule.default?.YoutubeiExtractor ??
+  youtubeiModule.default;
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -32,31 +42,76 @@ const player = new Player(client);
 async function loadMusicExtractors() {
   const registry = player.extractors;
 
-  if (typeof registry.loadMulti === "function") {
-    await registry.loadMulti(DefaultExtractors);
-    console.log("Music extractors loaded with loadMulti().");
-    return;
+  if (typeof registry.register !== "function") {
+    throw new Error(
+      `This Discord Player build does not expose extractors.register(). Available methods: ${
+        Object.getOwnPropertyNames(Object.getPrototypeOf(registry)).join(", ")
+      }`
+    );
   }
 
-  if (typeof registry.loadDefault === "function") {
-    await registry.loadDefault();
-    console.log("Music extractors loaded with loadDefault().");
-    return;
+  let defaults = DefaultExtractors;
+
+  if (!Array.isArray(defaults)) {
+    defaults = Object.entries({
+      ...extractorPackage,
+      ...extractorModule
+    })
+      .filter(([name, value]) =>
+        name.endsWith("Extractor") &&
+        name !== "YoutubeiExtractor" &&
+        typeof value === "function"
+      )
+      .map(([, value]) => value);
   }
 
-  if (typeof registry.register === "function") {
-    for (const extractor of DefaultExtractors) {
-      await registry.register(extractor);
+  if (!defaults?.length) {
+    throw new Error(
+      `No default extractors were found. Extractor module keys: ${
+        Object.keys(extractorModule).join(", ")
+      }`
+    );
+  }
+
+  let registered = 0;
+
+  for (const Extractor of defaults) {
+    try {
+      await registry.register(Extractor, {});
+      registered++;
+    } catch (error) {
+      const message = String(error?.message || error);
+
+      // Ignore only "already registered" style errors.
+      if (!/already|duplicate|registered/i.test(message)) {
+        console.error(
+          `Could not register extractor ${Extractor?.name || "unknown"}:`,
+          error
+        );
+      }
     }
-    console.log("Music extractors loaded individually with register().");
-    return;
   }
 
-  throw new Error(
-    `No compatible Discord Player extractor loader was found. Available methods: ${
-      Object.getOwnPropertyNames(Object.getPrototypeOf(registry)).join(", ")
-    }`
-  );
+  if (typeof YoutubeiExtractor !== "function") {
+    throw new Error(
+      `discord-player-youtubei did not expose YoutubeiExtractor. Module keys: ${
+        Object.keys(youtubeiModule).join(", ")
+      }`
+    );
+  }
+
+  try {
+    await registry.register(YoutubeiExtractor, {});
+    registered++;
+  } catch (error) {
+    const message = String(error?.message || error);
+
+    if (!/already|duplicate|registered/i.test(message)) {
+      throw error;
+    }
+  }
+
+  console.log(`Music extractors ready. Registered/available: ${registered}+`);
 }
 
 await loadMusicExtractors();
@@ -543,8 +598,19 @@ client.on("interactionCreate", async interaction => {
         } catch (error) {
           console.error("Play command error:", error);
 
+          const rawMessage = String(
+            error?.message ||
+            error?.cause?.message ||
+            error ||
+            "Unknown playback error"
+          );
+
+          const safeMessage = rawMessage
+            .replace(/`/g, "'")
+            .slice(0, 1200);
+
           await interaction.editReply(
-            "❌ I couldn't find or play that track. Try a more specific `song title + artist`, a YouTube link, or a Spotify track link."
+            `❌ I couldn't play that request.\n\n**Playback error:** \`${safeMessage}\`\n\nTry another song or link. If it still fails, send me this exact error text.`
           );
         }
 
