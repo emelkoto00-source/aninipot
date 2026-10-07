@@ -7,7 +7,8 @@ import {
 } from "discord.js";
 import { commandsJSON } from "./commands.js";
 import { Player } from "discord-player";
-import { DefaultExtractors } from "@discord-player/extractor";
+import extractorPackage from "@discord-player/extractor";
+const { DefaultExtractors } = extractorPackage;
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
