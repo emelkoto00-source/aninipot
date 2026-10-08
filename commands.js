@@ -141,10 +141,10 @@ export const commandBuilders = [
 
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Test YouTube playback using DisTube and yt-dlp.")
+    .setDescription("Play music using DisTube and yt-dlp.")
     .addStringOption(option =>
       option.setName("query")
-        .setDescription("Song and artist, a YouTube URL, or a Spotify track URL.")
+        .setDescription("YouTube video link or song title and artist.")
         .setRequired(true)
         .setMaxLength(1000)
     ),
@@ -152,6 +152,25 @@ export const commandBuilders = [
   new SlashCommandBuilder()
     .setName("stop")
     .setDescription("Stop the music and disconnect the bot from voice."),
+
+  new SlashCommandBuilder().setName('skip').setDescription('Skip the current song.'),
+  new SlashCommandBuilder().setName('next').setDescription('Skip to the next queued song.'),
+  new SlashCommandBuilder().setName('pause').setDescription('Pause music playback.'),
+  new SlashCommandBuilder().setName('resume').setDescription('Resume paused music.'),
+  new SlashCommandBuilder().setName('queue').setDescription('Show the current music queue.')
+    .addIntegerOption(option => option.setName('page').setDescription('Queue page').setMinValue(1).setRequired(false)),
+  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the song that is playing.'),
+  new SlashCommandBuilder().setName('autoplay').setDescription('Control automatic next-song recommendations.')
+    .addStringOption(option => option.setName('mode').setDescription('Autoplay mode').setRequired(true)
+      .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }, { name: 'Status', value: 'status' })),
+  new SlashCommandBuilder().setName('247').setDescription('Keep bebot connected between tracks (best effort).')
+    .addStringOption(option => option.setName('mode').setDescription('24/7 mode').setRequired(true)
+      .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }, { name: 'Status', value: 'status' })),
+  new SlashCommandBuilder().setName('volume').setDescription('Set music volume.')
+    .addIntegerOption(option => option.setName('level').setDescription('Volume percentage, 0 to 150').setRequired(true).setMinValue(0).setMaxValue(150)),
+  new SlashCommandBuilder().setName('leave').setDescription('Disconnect bebot from the voice channel.'),
+  new SlashCommandBuilder().setName('profile').setDescription('View your listening profile with Top Friends and Top Tracks.')
+    .addUserOption(option => option.setName('user').setDescription('Member to view').setRequired(false)),
 
   new SlashCommandBuilder()
     .setName("sticky")

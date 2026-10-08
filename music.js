@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
+import { createListeningStats } from "./music_stats.js";
 
 // Temporary YouTube-only replacement for bebot's existing Shoukaku music manager.
 // Extractor and relay code is from the user's uploaded MIT-licensed MusicBot/Beatra.
@@ -11,6 +12,9 @@ export function createMusicManager(client) {
   let initialization = null;
   let startupError = null;
   const idleTimers = new Map();
+  const stayConnected = new Set();
+  const autoplayPreferences = new Map();
+  const stats = createListeningStats(client, () => distube);
 
   function redact(error) {
     let msg = String(error?.message || error || "Unknown error");
@@ -29,6 +33,7 @@ export function createMusicManager(client) {
 
   function scheduleIdle(guildId) {
     cancelIdle(guildId);
+    if (stayConnected.has(guildId)) return;
     const timer = setTimeout(() => {
       idleTimers.delete(guildId);
       try {
@@ -66,6 +71,9 @@ export function createMusicManager(client) {
       });
       instance.on(Events.PLAY_SONG, (queue, song) => {
         cancelIdle(queue.id);
+        if (autoplayPreferences.has(queue.id) && Boolean(queue.autoplay) !== autoplayPreferences.get(queue.id)) {
+          try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
+        }
         console.log(`[DisTube trial] Playing in ${queue.id}: ${song.name} (${song.duration}s) [${song.source}]`);
       });
       instance.on(Events.ADD_SONG, (queue, song) => {
@@ -141,6 +149,9 @@ export function createMusicManager(client) {
         metadata: { guildId: interaction.guildId, requesterId: interaction.user.id }
       });
       const q = player.getQueue(interaction.guildId);
+      if (q && autoplayPreferences.has(interaction.guildId) && Boolean(q.autoplay) !== autoplayPreferences.get(interaction.guildId)) {
+        q.toggleAutoplay();
+      }
       const song = q?.songs?.at(-1);
       const embed = new EmbedBuilder()
         .setColor(0x5865f2)
@@ -169,6 +180,8 @@ export function createMusicManager(client) {
         interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
       if (!allowed) return interaction.editReply("Join the bot's voice channel or have **Manage Server** permission.");
       cancelIdle(interaction.guildId);
+      stayConnected.delete(interaction.guildId);
+      autoplayPreferences.delete(interaction.guildId);
       if (queue) await queue.stop();
       player.voices.leave(interaction.guildId);
       return interaction.editReply("⏹️ Stopped music and disconnected.");
@@ -178,5 +191,103 @@ export function createMusicManager(client) {
     }
   }
 
-  return { init, logStatus, play, stop };
+  // Playback controls are isolated from the working yt-dlp extractor and relay.
+  async function control(interaction) {
+    if (!interaction.inGuild()) return interaction.reply({ content: 'Use music commands in the Discord server.', ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    const command = interaction.commandName;
+    const player = distube;
+    const queue = player?.getQueue(interaction.guildId);
+    const voiceSession = player?.voices.get(interaction.guildId);
+    const channelId = queue?.voiceChannel?.id || voiceSession?.channelId;
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    const isManager = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+    const sameVoice = member?.voice?.channelId && member.voice.channelId === channelId;
+    const isListeningAction = !['queue', 'nowplaying'].includes(command);
+    if (isListeningAction && channelId && !sameVoice && !isManager) {
+      return interaction.editReply('Join my voice channel or have **Manage Server** permission.');
+    }
+    const reply = text => interaction.editReply({ content: text, allowedMentions: { parse: [] } });
+    try {
+      if (command === '247') {
+        const mode = interaction.options.getString('mode', true);
+        if (mode === 'status') return reply(`24/7 mode: **${stayConnected.has(interaction.guildId) ? 'ON' : 'OFF'}**. This setting resets after a bot restart.`);
+        if (mode === 'on') {
+          if (!channelId || (!sameVoice && !isManager)) return reply('Start `/play` in your voice channel first, then enable `/247 on`.');
+          stayConnected.add(interaction.guildId);
+          cancelIdle(interaction.guildId);
+          return reply('🔒 24/7 mode ON. I will not use the normal 2-minute idle timer. Discord or Railway disconnects may still occur.');
+        }
+        stayConnected.delete(interaction.guildId);
+        if (!queue) scheduleIdle(interaction.guildId);
+        return reply('🔓 24/7 mode OFF. Normal idle disconnect restored.');
+      }
+      if (command === 'autoplay') {
+        const mode = interaction.options.getString('mode', true);
+        const current = queue ? Boolean(queue.autoplay) : Boolean(autoplayPreferences.get(interaction.guildId));
+        if (mode === 'status') return reply(`Autoplay: **${current ? 'ON' : 'OFF'}**`);
+        if (!sameVoice && !isManager) return reply('Join the voice channel and start playing a song to change autoplay.');
+        const desired = mode === 'on';
+        autoplayPreferences.set(interaction.guildId, desired);
+        if (queue && current !== desired) queue.toggleAutoplay();
+        return reply(`🔁 Autoplay ${desired ? 'enabled' : 'disabled'}. Recommended songs still depend on YouTube availability.`);
+      }
+      if (command === 'queue') {
+        if (!queue?.songs?.length) return reply('📭 The music queue is empty.');
+        const page = interaction.options.getInteger('page') || 1;
+        const pageSize = 8;
+        const pages = Math.max(1, Math.ceil(queue.songs.length / pageSize));
+        if (page > pages) return reply(`That page does not exist. Choose a page between 1 and ${pages}.`);
+        const lines = queue.songs.slice((page - 1) * pageSize, page * pageSize).map((song,i) => {
+          const idx = (page - 1) * pageSize + i;
+          const title = String(song.name || 'Unknown').slice(0, 80).replaceAll('`', "'");
+          return `${idx === 0 ? '▶️' : `${idx + 1}.`} ${title} (${song.formattedDuration || 'Unknown duration'})`;
+        });
+        return interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xED91CF).setTitle('🎶 Music Queue').setDescription(lines.join('\n')).setFooter({ text: `Page ${page}/${pages} • ${queue.songs.length} song(s)` })] });
+      }
+      if (command === 'nowplaying') {
+        const song = queue?.songs?.[0];
+        if (!song) return reply('Nothing is playing right now.');
+        const e = new EmbedBuilder().setColor(0xED91CF).setTitle('🎵 Now Playing').setDescription(song.url ? `[${String(song.name).replaceAll('[','\\[').replaceAll(']','\\]')}](${song.url})` : song.name).addFields({ name: 'Position', value: `${Math.floor(queue.currentTime || 0)}s / ${song.formattedDuration || 'unknown'}` }, { name: 'Queue', value: `${queue.songs.length} song(s)` });
+        return interaction.editReply({ embeds: [e] });
+      }
+      if (!player || (!queue && !['leave','stop'].includes(command))) return reply('No active song. Use `/play` first.');
+      if (!channelId && command !== 'leave') return reply('No voice session is active.');
+      if (command === 'skip' || command === 'next') {
+        if (queue.songs.length <= 1 && !queue.autoplay) {
+          await queue.stop();
+          scheduleIdle(interaction.guildId);
+          return reply('⏭️ Skipped the final track. Queue is now empty.');
+        }
+        await queue.skip();
+        return reply('⏭️ Skipped to the next track.');
+      }
+      if (command === 'pause') {
+        if (queue.paused) return reply('Already paused.');
+        await queue.pause(); return reply('⏸️ Paused playback.');
+      }
+      if (command === 'resume') {
+        if (!queue.paused) return reply('Playback is not paused.');
+        await queue.resume(); return reply('▶️ Resumed playback.');
+      }
+      if (command === 'volume') {
+        const value = interaction.options.getInteger('level', true);
+        queue.setVolume(value); return reply(`🔊 Volume set to **${value}%**.`);
+      }
+      if (command === 'leave') {
+        stayConnected.delete(interaction.guildId);
+        autoplayPreferences.delete(interaction.guildId);
+        cancelIdle(interaction.guildId);
+        if (queue) await queue.stop();
+        if (voiceSession) player.voices.leave(interaction.guildId);
+        return reply('👋 Left the voice channel.');
+      }
+      return reply('Unknown music command.');
+    } catch (error) {
+      console.error(`[DisTube controls] ${command}:`, redact(error));
+      return reply(`❌ ${command} failed: ${redact(error)}`);
+    }
+  }
+
+  return { init, logStatus, play, stop, control, stats };
 }

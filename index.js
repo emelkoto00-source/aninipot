@@ -7,6 +7,7 @@ import {
 } from "discord.js";
 import { commandsJSON } from "./commands.js";
 import { createMusicManager } from "./music.js";
+import { makeProfileCard } from "./music_profile.js";
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
@@ -400,6 +401,15 @@ client.on("interactionCreate", async interaction => {
           "`/help` — Show this list",
           "`/play <query>` — Test YouTube audio through DisTube + yt-dlp",
           "`/stop` — Stop playback and disconnect from voice",
+          "`/skip` or `/next` — Skip a song",
+          "`/pause` / `/resume` — Pause or resume",
+          "`/queue [page]` — View queued songs",
+          "`/nowplaying` — Display current track",
+          "`/autoplay <on|off|status>` — Auto next-song suggestions",
+          "`/247 <on|off|status>` — Keep voice connected when idle",
+          "`/volume <level>` — Adjust volume",
+          "`/leave` — Leave voice channel",
+          "`/profile [user]` — Listening profile with Top Friends and Tracks",
           "`/sticky <message>` — Moderator: keep a message at the bottom of the channel",
           "`/unsticky` — Moderator: remove the channel sticky",
           "`/clear <amount>` — Moderator: delete recent messages",
@@ -424,6 +434,36 @@ client.on("interactionCreate", async interaction => {
 
       case "stop": {
         await music.stop(interaction);
+        break;
+      }
+
+      case 'skip':
+      case 'next':
+      case 'queue':
+      case 'autoplay':
+      case '247':
+      case 'leave':
+      case 'pause':
+      case 'resume':
+      case 'volume':
+      case 'nowplaying': {
+        await music.control(interaction);
+        break;
+      }
+
+      case 'profile': {
+        if (!interaction.inGuild()) {
+          await interaction.reply({ content: 'Use `/profile` inside the server.', ephemeral: true });
+          break;
+        }
+        await interaction.deferReply();
+        try {
+          const card = await makeProfileCard(interaction, music.stats);
+          await interaction.editReply({ files: [card] });
+        } catch (err) {
+          console.error('[Profile] Rendering failed:', err);
+          await interaction.editReply('Could not generate the listening profile image. Check Railway logs and the profile background file.');
+        }
         break;
       }
 
