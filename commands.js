@@ -141,14 +141,17 @@ export const commandBuilders = [
 
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Play or queue a song in your voice channel.")
+    .setDescription("Play or queue music using Lavalink.")
     .addStringOption(option =>
-      option
-        .setName("query")
-        .setDescription("Song + artist, YouTube link, or Spotify link.")
+      option.setName("query")
+        .setDescription("Song and artist, a YouTube URL, or a Spotify track URL.")
         .setRequired(true)
         .setMaxLength(1000)
     ),
+
+  new SlashCommandBuilder()
+    .setName("stop")
+    .setDescription("Stop the music and disconnect the bot from voice."),
 
   new SlashCommandBuilder()
     .setName("sticky")
