@@ -14,7 +14,44 @@ export function createMusicManager(client) {
   const idleTimers = new Map();
   const stayConnected = new Set();
   const autoplayPreferences = new Map();
+  // Discord channel used for announcements; separate from the audio pipeline.
+  const announcementChannels = new Map();
+  const suppressFirstStart = new Set();
+  const lastSongAnnouncements = new Map();
   const stats = createListeningStats(client, () => distube);
+
+  function safeTitle(value) {
+    return String(value || 'Unknown song').replace(/([\\`*_{}\[\]()#+.!>~-])/g, '\\$1').slice(0, 220);
+  }
+
+  async function announceNextSong(queue, song) {
+    const guildId = queue?.id;
+    if (!guildId || !song) return;
+    const cached = queue.textChannel?.send ? queue.textChannel : null;
+    const channelId = announcementChannels.get(guildId);
+    const channel = cached || (channelId ? await client.channels.fetch(channelId).catch(() => null) : null);
+    if (!channel?.send) {
+      console.warn(`[DisTube] No text channel available for song announcement in ${guildId}`);
+      return;
+    }
+    const title = safeTitle(song.name);
+    const songURL = /^https?:\/\//i.test(String(song.url || '')) ? song.url : null;
+    const artist = typeof song.uploader === 'string' ? song.uploader : song.uploader?.name;
+    const embed = new EmbedBuilder()
+      .setColor(0xED91CF)
+      .setTitle('🎵 Now Playing')
+      .setDescription(songURL ? `[${title}](${songURL})` : `**${title}**`);
+    if (artist) embed.addFields({ name: 'Artist', value: String(artist).slice(0, 160), inline: true });
+    if (song.formattedDuration) embed.addFields({ name: 'Duration', value: String(song.formattedDuration), inline: true });
+    const imageURL = String(song.thumbnail || '');
+    if (/^https?:\/\//i.test(imageURL)) embed.setThumbnail(imageURL);
+    try {
+      await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+      console.log(`[DisTube] Announced next song in ${guildId}: ${song.name}`);
+    } catch (error) {
+      console.warn(`[DisTube] Could not announce song in ${guildId}:`, redact(error));
+    }
+  }
 
   function redact(error) {
     let msg = String(error?.message || error || "Unknown error");
@@ -110,6 +147,15 @@ export function createMusicManager(client) {
           try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
         }
         console.log(`[DisTube trial] Playing in ${queue.id}: ${song.name} (${song.duration}s) [${song.source}]`);
+        // /play already sends a response for the first song. Announce subsequent
+        // songs (playlist entries, /skip, and autoplay) in the text channel.
+        if (suppressFirstStart.delete(queue.id)) return;
+        const key = String(song.id || song.url || song.name);
+        const previous = lastSongAnnouncements.get(queue.id);
+        const now = Date.now();
+        if (previous?.key === key && now - previous.at < 10_000) return;
+        lastSongAnnouncements.set(queue.id, { key, at: now });
+        void announceNextSong(queue, song);
       });
       instance.on(Events.ADD_SONG, (queue, song) => {
         console.log(`[DisTube trial] Queued in ${queue.id}: ${song.name}`);
@@ -177,6 +223,8 @@ export function createMusicManager(client) {
         throw new Error("Music is already active in another voice channel. Use `/stop` there first.");
       }
       cancelIdle(interaction.guildId);
+      announcementChannels.set(interaction.guildId, interaction.channelId);
+      if (!current) suppressFirstStart.add(interaction.guildId);
       console.log(`[DisTube trial] /play requested for guild ${interaction.guildId}: ${query.slice(0, 120)}`);
       await player.play(voice, query, {
         member,
@@ -194,6 +242,7 @@ export function createMusicManager(client) {
         .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"));
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
+      suppressFirstStart.delete(interaction.guildId);
       console.error("[DisTube trial] /play error:", redact(error));
       await interaction.editReply(`❌ Unable to play this song: ${redact(error)}\nYouTube may be blocking this server, and no verified full-length alternative was available.`);
     }
@@ -215,6 +264,8 @@ export function createMusicManager(client) {
       cancelIdle(interaction.guildId);
       stayConnected.delete(interaction.guildId);
       autoplayPreferences.delete(interaction.guildId);
+      suppressFirstStart.delete(interaction.guildId);
+      lastSongAnnouncements.delete(interaction.guildId);
       if (queue) await queue.stop();
       player.voices.leave(interaction.guildId);
       return interaction.editReply("⏹️ Stopped music and disconnected.");
