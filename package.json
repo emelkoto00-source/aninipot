@@ -1,7 +1,7 @@
 {
   "name": "railway-discord-bot",
   "version": "1.0.0",
-  "description": "bebot: DisTube/yt-dlp music playback with Spotify track and playlist links",
+  "description": "bebot: original commands with a temporary DisTube/yt-dlp playback test",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -19,7 +19,6 @@
     "opusscript": "^0.0.8",
     "ffmpeg-static": "^5.3.0",
     "@distube/soundcloud": "^2.0.4",
-    "@distube/direct-link": "^1.0.1",
-    "@distube/spotify": "^2.0.2"
+    "@distube/direct-link": "^1.0.1"
   }
 }

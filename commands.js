@@ -141,10 +141,10 @@ export const commandBuilders = [
 
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Play a song or Spotify playlist using YouTube audio.")
+    .setDescription("Test YouTube playback using DisTube and yt-dlp.")
     .addStringOption(option =>
       option.setName("query")
-        .setDescription("Song name, YouTube link, Spotify track or playlist link.")
+        .setDescription("Song and artist, a YouTube URL, or a Spotify track URL.")
         .setRequired(true)
         .setMaxLength(1000)
     ),

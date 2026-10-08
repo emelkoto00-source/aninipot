@@ -17,8 +17,6 @@ const YOUTUBE_HOSTS = new Set([
 const VIDEO_ID = /^[\w-]{11}$/;
 const BLOCKED_AFTER_FAILURES = 3;
 const BLOCKED_PAUSE_MS = 10 * 60_000;
-const YOUTUBE_API_RESULTS = 5;
-const YOUTUBE_API_STREAM_ATTEMPTS = 3;
 
 // Every song carries its guild id in metadata so proxy selection never depends on a cached member.
 const guildIdOf = (holder) => holder?.metadata?.guildId || holder?.member?.guild?.id || null;
@@ -234,79 +232,9 @@ class YouTubePlugin extends ExtractorPlugin {
         }
     }
 
-    /**
-     * Official YouTube Data API search resolves video IDs without using yt-dlp's
-     * `ytsearch:` extractor, which can be denied on datacenter addresses even
-     * when yt-dlp can successfully stream an explicit YouTube video URL.
-     *
-     * Note that the Data API supplies *metadata only*. The playable audio still
-     * comes through the existing yt-dlp -> relay pipeline once we have an ID.
-     */
-    async searchViaDataApi(query, { proxy, priority }) {
-        const key = String(process.env.YOUTUBE_API_KEY || '').trim();
-        if (!key) throw new Error('YOUTUBE_API_KEY is missing. Add a restricted YouTube Data API v3 key to Railway Variables.');
-
-        const params = new URLSearchParams({
-            part: 'snippet',
-            type: 'video',
-            maxResults: String(YOUTUBE_API_RESULTS),
-            q: String(query),
-            key,
-        });
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 12_000);
-        let response;
-        try {
-            response = await fetch(`https://www.googleapis.com/youtube/v3/search?${params.toString()}`, {
-                signal: controller.signal,
-                headers: { Accept: 'application/json' },
-            });
-        } catch (error) {
-            // Never embed the request URL in errors: it contains the secret API key.
-            throw new Error(error?.name === 'AbortError'
-                ? 'YouTube Data API search timed out.'
-                : 'YouTube Data API search could not connect.');
-        } finally {
-            clearTimeout(timeout);
-        }
-        if (!response.ok) {
-            if (response.status === 403) throw new Error('YouTube Data API returned 403. Check that the API is enabled, the key is allowed to use it, and search quota remains.');
-            if (response.status === 400) throw new Error('YouTube Data API returned 400. Verify your YOUTUBE_API_KEY in Railway.');
-            throw new Error(`YouTube Data API search failed (HTTP ${response.status}).`);
-        }
-        let data;
-        try { data = await response.json(); }
-        catch { throw new Error('YouTube Data API returned an invalid response.'); }
-        const ids = (Array.isArray(data?.items) ? data.items : [])
-            .map(item => item?.id?.videoId)
-            .filter(id => typeof id === 'string' && VIDEO_ID.test(id))
-            .slice(0, YOUTUBE_API_STREAM_ATTEMPTS);
-        if (!ids.length) return null;
-
-        let lastFailure;
-        for (const id of ids) {
-            try {
-                // Same direct URL extraction that succeeded in the earlier Railway test.
-                const result = await this.run(watchUrl(id), ['--no-playlist', '-f', AUDIO_FORMAT], { proxy, priority });
-                if (result?.id && result?.url && result?.format_id) return result;
-            } catch (error) {
-                lastFailure = error;
-                log.warn(`YouTube result ${id} could not be opened for audio; checking the next candidate.`);
-            }
-        }
-        // Do not conceal stream access problems behind an apparent "no results".
-        throw new Error(`YouTube search found videos, but none of the first ${ids.length} could provide audio.${lastFailure ? ' Direct-video extraction also failed.' : ''}`);
-    }
-
     searchInfo(query, guildId, { priority = 'high' } = {}) {
         const proxy = ytdlp.proxyFor(guildId);
         return this.searches.wrap(`${proxy || 'direct'}|${query.toLowerCase()}`, async () => {
-            // Spotify track resolution and text /play searches both use searchInfo.
-            // Prefer official metadata search if an API key exists; do not send
-            // the same query to ytsearch afterward if the API reports a failure.
-            if (String(process.env.YOUTUBE_API_KEY || '').trim()) {
-                return this.searchViaDataApi(query, { proxy, priority });
-            }
             const result = await this.run(`ytsearch1:${query}`, ['-f', AUDIO_FORMAT], { proxy, priority });
             const info = result?.entries ? result.entries.find(Boolean) : result;
             return info?.id ? info : null;
