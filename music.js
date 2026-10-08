@@ -49,7 +49,8 @@ export function createMusicManager(client) {
   function redact(error) {
     let msg = String(error?.message || error || "Unknown error");
     for (const secret of [process.env.DISCORD_TOKEN, process.env.PROXY_URL,
-      process.env.COOKIES_FILE, process.env.YOUTUBE_PO_TOKEN]) {
+      process.env.COOKIES_FILE, process.env.YOUTUBE_PO_TOKEN, process.env.YOUTUBE_API_KEY,
+      process.env.SPOTIFY_CLIENT_SECRET]) {
       if (secret) msg = msg.split(secret).join("[redacted]");
     }
     // yt-dlp may include signed CDN links; avoid exposing them in Discord messages.
@@ -125,13 +126,23 @@ export function createMusicManager(client) {
       });
       instance.on(Events.ERROR, (error, queue, song) => {
         console.error(`[DisTube trial] Audio failed in ${queue?.id || "unknown"} (${song?.name || "unknown"}): ${redact(error)}`);
+        // A request can be accepted before a playable audio stream exists.
+        // Surface asynchronous playback errors to the channel, not only Railway logs.
+        const textChannel = queue?.textChannel;
+        if (textChannel?.send) {
+          const trackName = markdownTitle(song?.name || 'Requested song');
+          void textChannel.send({
+            content: `❌ Unable to play **${trackName}**. ${redact(error).slice(0, 350)}`,
+            allowedMentions: { parse: [] }
+          }).catch(() => {});
+        }
       });
       if (String(process.env.DEBUG || "").toLowerCase() === "true") {
         instance.on(Events.DEBUG, msg => console.log("[DisTube debug]", msg));
       }
       distube = instance;
       startupError = null;
-      console.log("[DisTube trial] Ready. Spotify links enabled; audio via YouTube/yt-dlp; SoundCloud fallback OFF.");
+      console.log(`[DisTube trial] Ready. Spotify links enabled; YouTube metadata search: ${process.env.YOUTUBE_API_KEY ? 'Data API v3' : 'yt-dlp search (may be blocked)'}; SoundCloud fallback OFF.`);
       return instance;
     })().catch(err => {
       startupError = redact(err);
@@ -211,7 +222,8 @@ export function createMusicManager(client) {
           (omitted ? `\nLimited to ${MAX_SPOTIFY_PLAYLIST_TRACKS} songs per request (${omitted} omitted).` : "");
       } else if (spotifyRequest) {
         const label = markdownTitle(resolved.name || "Spotify track");
-        description = `${current ? "🎶 Queued" : "▶️ Started playing"} **[${label}](${spotifyUrl})**`;
+        // play() may queue successfully before yt-dlp returns an audio stream.
+        description = `${current ? "🎶 Queued" : "🎧 Loading audio for"} **[${label}](${spotifyUrl})**`;
       } else {
         description = pending?.url
           ? `${current ? "🎶 Queued" : "▶️ Started playing"} **[${markdownTitle(pending.name)}](${pending.url})**`
