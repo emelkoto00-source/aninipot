@@ -2,9 +2,9 @@ import { createRequire } from "node:module";
 import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
 import { createListeningStats } from "./music_stats.js";
 
-// Temporary YouTube-only replacement for bebot's existing Shoukaku music manager.
-// Extractor and relay code is from the user's uploaded MIT-licensed MusicBot/Beatra.
-// No SoundCloud auto-fallback: source failures must be visible during this test.
+// DisTube music manager. YouTube remains first choice; guarded SoundCloud is an
+// alternative only when full-length playback is plausible (no preview URLs).
+// The Beatra YouTube extractor, yt-dlp runner and audio relay remain unchanged.
 const require = createRequire(import.meta.url);
 
 export function createMusicManager(client) {
@@ -56,11 +56,37 @@ export function createMusicManager(client) {
       if (!ytDlpPath || !ffmpegPath) {
         throw new Error("Missing yt-dlp or FFmpeg. See the Railway Deploy Logs for the download error.");
       }
-      console.log("[DisTube trial] Executables ready. YouTube fallback: DISABLED.");
+      console.log("[DisTube] Executables ready. YouTube first, SoundCloud preview guard enabled.");
       const { DisTube, Events } = require("distube");
       const { YouTubePlugin } = require("./beatra_engine/src/music/plugins.js");
+      const { SoundCloudPlugin } = require("@distube/soundcloud");
+      // The original Beatra YouTubePlugin can use a SoundCloudPlugin as a fallback.
+      // Reject the identifiable /preview/ streams that previously cut songs to ~30s.
+      const soundcloud = new SoundCloudPlugin();
+      const originalSearchSong = soundcloud.searchSong.bind(soundcloud);
+      soundcloud.searchSong = async (...args) => {
+        const candidate = await originalSearchSong(...args);
+        if (candidate && Number(candidate.duration) > 0 && Number(candidate.duration) < 60) {
+          console.warn("[DisTube] Rejected short SoundCloud search result:", candidate.name);
+          return null;
+        }
+        return candidate;
+      };
+      const originalGetStreamURL = soundcloud.getStreamURL.bind(soundcloud);
+      soundcloud.getStreamURL = async song => {
+        const result = await originalGetStreamURL(song);
+        const streamUrl = typeof result === 'string' ? result : (result?.url || '');
+        if (typeof streamUrl !== 'string' || !/^https?:\/\//i.test(streamUrl)) {
+          throw new Error('SoundCloud did not provide a supported full-track stream URL.');
+        }
+        if (/(?:\/|%2f)preview(?:\/|%2f|\?|$)/i.test(streamUrl) || /(?:[?&]type=preview)/i.test(streamUrl)) {
+          console.warn('[DisTube] Rejected preview-only SoundCloud stream:', song?.name || 'unknown');
+          throw new Error('SoundCloud provided only a preview clip; refusing to play it as a full song.');
+        }
+        return result;
+      };
       const instance = new DisTube(client, {
-        plugins: [new YouTubePlugin({ fallback: null })],
+        plugins: [new YouTubePlugin({ fallback: soundcloud }), soundcloud],
         emitAddSongWhenCreatingQueue: false,
         emitAddListWhenCreatingQueue: false,
         joinNewVoiceChannel: false,
@@ -126,12 +152,12 @@ export function createMusicManager(client) {
       return interaction.reply({ content: "bebot needs **Connect** and **Speak** permissions in your voice channel.", ephemeral: true });
     }
     const query = interaction.options.getString("query", true).trim();
-    if (!query) return interaction.reply({ content: "Please provide a YouTube URL or song title.", ephemeral: true });
+    if (!query) return interaction.reply({ content: "Please provide a YouTube/SoundCloud URL or a song title.", ephemeral: true });
     if (/^https?:\/\//i.test(query)) {
       let hostname = "";
       try { hostname = new URL(query).hostname.toLowerCase(); } catch { /* invalid URL */ }
-      if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"].includes(hostname)) {
-        return interaction.reply({ content: "During this test, `/play` accepts **YouTube URLs or song titles only**. Spotify/SoundCloud will be added after the audio test succeeds.", ephemeral: true });
+      if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be", "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com"].includes(hostname)) {
+        return interaction.reply({ content: "Use a **YouTube or SoundCloud track URL**, or search by song title. Spotify links are not enabled.", ephemeral: true });
       }
     }
     await interaction.deferReply();
@@ -153,29 +179,16 @@ export function createMusicManager(client) {
         q.toggleAutoplay();
       }
       const song = q?.songs?.at(-1);
-      // Presentation only; do not alter the working extractor or playback flow.
-      const isQueued = Boolean(q?.songs?.length > 1);
-      const trackName = String(song?.name || "Music request submitted")
-        .replace(/[\r\n]+/g, " ").slice(0, 180);
-      const safeName = trackName.replace(/[\\[\]()*_~`]/g, "\\$&");
-      const trackUrl = typeof song?.url === "string" && /^https?:\/\//i.test(song.url)
-        ? song.url.replace(/\)/g, "%29") : null;
-      const titleLine = trackUrl ? `**[${safeName}](${trackUrl})**` : `**${safeName}**`;
-      const uploaderValue = song?.uploader?.name || song?.uploader || song?.artist || song?.author;
-      const artistLine = typeof uploaderValue === "string"
-        ? uploaderValue.replace(/[\r\n]+/g, " ").slice(0, 90) : "";
-      const durationLine = song?.formattedDuration ? `⏱️ ${song.formattedDuration}` : "";
-      const details = [titleLine, artistLine, durationLine].filter(Boolean).join("\n");
       const embed = new EmbedBuilder()
-        .setColor(0xED91CF)
-        .setTitle(isQueued ? "🎶 Added to Queue" : "🎶 Now Playing")
-        .setDescription(details);
-      const thumbnail = typeof song?.thumbnail === "string" ? song.thumbnail : "";
-      if (/^https?:\/\//i.test(thumbnail)) embed.setThumbnail(thumbnail);
+        .setColor(0x5865f2)
+        .setTitle("🎵 DisTube Playback Test")
+        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"))
+        .addFields({ name: "Source", value: "YouTube via yt-dlp (SoundCloud fallback OFF)" })
+        .setFooter({ text: "Confirm that audio plays to the end; check Railway logs if it fails." });
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       console.error("[DisTube trial] /play error:", redact(error));
-      await interaction.editReply(`❌ Music test failed: ${redact(error)}\nNo SoundCloud preview was substituted.`);
+      await interaction.editReply(`❌ Unable to play this song: ${redact(error)}\nYouTube may be blocking this server, and no verified full-length alternative was available.`);
     }
   }
 
