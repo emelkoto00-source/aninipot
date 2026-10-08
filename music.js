@@ -20,6 +20,36 @@ export function createMusicManager(client) {
   const lastSongAnnouncements = new Map();
   const stats = createListeningStats(client, () => distube);
 
+  // Fail closed on unrelated SoundCloud matches. DisTube's fallback previously
+  // accepted its first result, even when requesting "Mine" returned "Wildest Dreams".
+  // This is intentionally conservative: when uncertain, do not substitute a song.
+  function soundcloudMatch(query, candidate) {
+    const normalized = value => String(value || '')
+      .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase().replace(/['’]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+    const requested = normalized(query).split(/\s+/).filter(Boolean);
+    const uploader = typeof candidate?.uploader === 'string' ? candidate.uploader : candidate?.uploader?.name;
+    const title = normalized(candidate?.name);
+    const candidateText = normalized(`${candidate?.name || ''} ${uploader || ''}`);
+    const actual = new Set(candidateText.split(/\s+/).filter(Boolean));
+    if (!requested.length || !title) return false;
+    // A prominent title word must occur. Artist/version matches alone are not enough.
+    const skip = new Set(['the', 'a', 'an', 'and', 'ft', 'feat', 'featuring',
+      'official', 'video', 'audio', 'lyrics', 'lyric', 'music', 'song', 'version']);
+    const lead = requested.find(word => !skip.has(word)) || requested[0];
+    if (!actual.has(lead)) return false;
+    const meaningful = requested.filter(word => !skip.has(word));
+    if (meaningful.length > 1) {
+      const hits = meaningful.filter(word => actual.has(word)).length;
+      if (hits / meaningful.length < 0.65) return false;
+    }
+    // Do not quietly substitute covers, sped-up edits or karaoke versions.
+    for (const qualifier of ['cover', 'karaoke', 'nightcore', 'instrumental', 'remix']) {
+      if (title.split(' ').includes(qualifier) && !requested.includes(qualifier)) return false;
+    }
+    return true;
+  }
+
   function safeTitle(value) {
     return String(value || 'Unknown song').replace(/([\\`*_{}\[\]()#+.!>~-])/g, '\\$1').slice(0, 220);
   }
@@ -106,8 +136,14 @@ export function createMusicManager(client) {
       const originalSearchSong = soundcloud.searchSong.bind(soundcloud);
       soundcloud.searchSong = async (...args) => {
         const candidate = await originalSearchSong(...args);
-        if (candidate && Number(candidate.duration) > 0 && Number(candidate.duration) < 60) {
-          console.warn("[DisTube] Rejected short SoundCloud search result:", candidate.name);
+        if (!candidate) return null;
+        if (Number(candidate.duration) > 0 && Number(candidate.duration) < 60) {
+          console.warn('[DisTube] Rejected short SoundCloud result:', candidate.name);
+          return null;
+        }
+        if (!soundcloudMatch(args[0], candidate)) {
+          console.warn('[DisTube] Rejected mismatched SoundCloud fallback:',
+            JSON.stringify({ requested: String(args[0]).slice(0, 100), found: String(candidate.name || '').slice(0, 100) }));
           return null;
         }
         return candidate;
@@ -127,8 +163,16 @@ export function createMusicManager(client) {
         const guildId = song?.metadata?.guildId || song?.member?.guild?.id || null;
         // relayStream waits for media bytes. If the download fails or only
         // returns HTTP 403, /play fails instead of reporting a silent start.
-        const relayUrl = await relayStream(soundcloud.relay, { url: streamUrl, proxy: proxyFor(guildId) });
-        console.log(`[DisTube] SoundCloud audio relay ready: ${String(song?.name || 'track').slice(0, 120)}`);
+        let relayUrl;
+        try {
+          relayUrl = await relayStream(soundcloud.relay, { url: streamUrl, proxy: proxyFor(guildId) });
+        } catch (error) {
+          if (/drm protected|encrypted content|protected by drm/i.test(String(error?.message || error))) {
+            throw new Error('SoundCloud offered a DRM-protected stream, which bebot cannot play.');
+          }
+          throw error;
+        }
+        console.log(`[DisTube] SoundCloud relay opened: ${String(song?.name || 'track').slice(0, 120)}`);
         return relayUrl;
       };
       const instance = new DisTube(client, {
@@ -155,7 +199,16 @@ export function createMusicManager(client) {
         const now = Date.now();
         if (previous?.key === key && now - previous.at < 10_000) return;
         lastSongAnnouncements.set(queue.id, { key, at: now });
-        void announceNextSong(queue, song);
+        // PLAY_SONG is not proof that packets reached Discord. Avoid announcing
+        // tracks whose queue immediately disappears due to a media/DRM error.
+        const announceTimer = setTimeout(() => {
+          const active = distube?.getQueue(queue.id);
+          const current = active?.songs?.[0];
+          if (active === queue && current && String(current.id || current.url || current.name) === key) {
+            void announceNextSong(queue, song);
+          }
+        }, 2500);
+        announceTimer.unref?.();
       });
       instance.on(Events.ADD_SONG, (queue, song) => {
         console.log(`[DisTube trial] Queued in ${queue.id}: ${song.name}`);
