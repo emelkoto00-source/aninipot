@@ -141,7 +141,7 @@ export const commandBuilders = [
 
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Play or queue music using Lavalink.")
+    .setDescription("Test YouTube playback using DisTube and yt-dlp.")
     .addStringOption(option =>
       option.setName("query")
         .setDescription("Song and artist, a YouTube URL, or a Spotify track URL.")

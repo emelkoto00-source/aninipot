@@ -1,287 +1,182 @@
-import { Shoukaku, Connectors } from "shoukaku";
+import { createRequire } from "node:module";
 import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
 
-// All connection settings come from Railway environment variables.
-// Public Railway HTTPS/WSS domain: port=443, secure=true.
+// Temporary YouTube-only replacement for bebot's existing Shoukaku music manager.
+// Extractor and relay code is from the user's uploaded MIT-licensed MusicBot/Beatra.
+// No SoundCloud auto-fallback: source failures must be visible during this test.
+const require = createRequire(import.meta.url);
+
 export function createMusicManager(client) {
-  const host = (process.env.LAVALINK_HOST || "").trim().replace(/^https?:\/\//, "").replace(/\/$/, "");
-  const port = Number(process.env.LAVALINK_PORT || "443");
-  const auth = process.env.LAVALINK_PASSWORD || "";
-  const secure = String(process.env.LAVALINK_SECURE || "true").toLowerCase() === "true";
-  const configured = Boolean(host && auth && port > 0 && port <= 65535);
+  let distube = null;
+  let initialization = null;
+  let startupError = null;
+  const idleTimers = new Map();
 
-  const sessions = new Map();
-  let shoukaku = null;
-  let lastConnectionError = "Not connected to Lavalink yet";
+  function redact(error) {
+    let msg = String(error?.message || error || "Unknown error");
+    for (const secret of [process.env.DISCORD_TOKEN, process.env.PROXY_URL,
+      process.env.COOKIES_FILE, process.env.YOUTUBE_PO_TOKEN]) {
+      if (secret) msg = msg.split(secret).join("[redacted]");
+    }
+    // yt-dlp may include signed CDN links; avoid exposing them in Discord messages.
+    return msg.replace(/https?:\/\/\S+/g, "[media URL]").slice(0, 650).replaceAll("`", "'");
+  }
 
-  if (configured) {
-    const node = {
-      name: "railway-lavalink",
-      url: `${host}:${port}`,
-      auth,
-      secure
-    };
+  function cancelIdle(guildId) {
+    if (idleTimers.has(guildId)) clearTimeout(idleTimers.get(guildId));
+    idleTimers.delete(guildId);
+  }
 
-    shoukaku = new Shoukaku(
-      new Connectors.DiscordJS(client),
-      [node],
-      {
-        resume: true,
-        reconnectTries: 5,
-        reconnectInterval: 5,
-        restTimeout: 15000
+  function scheduleIdle(guildId) {
+    cancelIdle(guildId);
+    const timer = setTimeout(() => {
+      idleTimers.delete(guildId);
+      try {
+        if (!distube?.getQueue(guildId)) distube?.voices.leave(guildId);
+      } catch (error) { console.warn("[DisTube trial] Idle leave:", redact(error)); }
+    }, 120_000);
+    timer.unref?.();
+    idleTimers.set(guildId, timer);
+  }
+
+  async function init() {
+    if (distube) return distube;
+    if (initialization) return initialization;
+    initialization = (async () => {
+      // Download/check both executables BEFORE requiring the yt-dlp runner. The runner
+      // resolves its binary path at module load time.
+      const { ensureYtDlp, ensureFfmpeg } = require("./beatra_engine/src/core/binaries.js");
+      console.log("[DisTube trial] Checking yt-dlp and FFmpeg (first boot may take longer)...");
+      const [ytDlpPath, ffmpegPath] = await Promise.all([ensureYtDlp(), ensureFfmpeg()]);
+      if (!ytDlpPath || !ffmpegPath) {
+        throw new Error("Missing yt-dlp or FFmpeg. See the Railway Deploy Logs for the download error.");
       }
-    );
-
-    shoukaku.on("ready", name => {
-      lastConnectionError = "";
-      console.log(`[Lavalink] Connected: ${name}`);
+      console.log("[DisTube trial] Executables ready. YouTube fallback: DISABLED.");
+      const { DisTube, Events } = require("distube");
+      const { YouTubePlugin } = require("./beatra_engine/src/music/plugins.js");
+      const instance = new DisTube(client, {
+        plugins: [new YouTubePlugin({ fallback: null })],
+        emitAddSongWhenCreatingQueue: false,
+        emitAddListWhenCreatingQueue: false,
+        joinNewVoiceChannel: false,
+        ffmpeg: {
+          path: ffmpegPath,
+          args: { input: { reconnect: 0, reconnect_streamed: 0, reconnect_delay_max: null } }
+        }
+      });
+      instance.on(Events.PLAY_SONG, (queue, song) => {
+        cancelIdle(queue.id);
+        console.log(`[DisTube trial] Playing in ${queue.id}: ${song.name} (${song.duration}s) [${song.source}]`);
+      });
+      instance.on(Events.ADD_SONG, (queue, song) => {
+        console.log(`[DisTube trial] Queued in ${queue.id}: ${song.name}`);
+      });
+      instance.on(Events.FINISH, queue => {
+        console.log(`[DisTube trial] Queue finished in ${queue.id}`);
+        scheduleIdle(queue.id);
+      });
+      instance.on(Events.DISCONNECT, queue => {
+        cancelIdle(queue.id);
+        console.warn(`[DisTube trial] Disconnected in ${queue.id}`);
+      });
+      instance.on(Events.DELETE_QUEUE, queue => {
+        console.log(`[DisTube trial] Queue deleted in ${queue.id}`);
+        scheduleIdle(queue.id);
+      });
+      instance.on(Events.ERROR, (error, queue, song) => {
+        console.error(`[DisTube trial] Audio failed in ${queue?.id || "unknown"} (${song?.name || "unknown"}): ${redact(error)}`);
+      });
+      if (String(process.env.DEBUG || "").toLowerCase() === "true") {
+        instance.on(Events.DEBUG, msg => console.log("[DisTube debug]", msg));
+      }
+      distube = instance;
+      startupError = null;
+      console.log("[DisTube trial] Ready. Lavalink is not used by this build.");
+      return instance;
+    })().catch(err => {
+      startupError = redact(err);
+      initialization = null; // retry when /play is next requested
+      console.error("[DisTube trial] Startup failure:", startupError);
+      throw err;
     });
-    shoukaku.on("error", (name, error) => {
-      lastConnectionError = error?.message || String(error);
-      console.error(`[Lavalink] ${name} error:`, lastConnectionError);
-    });
-    shoukaku.on("close", (name, code, reason) => {
-      lastConnectionError = `Disconnected (${code}): ${String(reason || "no reason")}`;
-      console.warn(`[Lavalink] ${name}:`, lastConnectionError);
-    });
-    shoukaku.on("disconnect", (name, count) => {
-      console.warn(`[Lavalink] ${name} disconnected. Reconnect attempt ${count}`);
-    });
+    return initialization;
   }
 
   function logStatus() {
-    if (!configured) {
-      console.warn("[Lavalink] Missing/invalid Railway LAVALINK_HOST, PORT, PASSWORD or SECURE settings.");
-    } else {
-      console.log(`[Lavalink] Configured: ${host}:${port} (secure=${secure}). Waiting for ready event.`);
-    }
-  }
-
-  function bestNode() {
-    return shoukaku?.getIdealNode?.() || null;
-  }
-
-  function sanitizeError(error) {
-    return String(error?.message || error || "Unknown error")
-      .replaceAll("`", "'")
-      .replaceAll(auth || "__no_secret_defined__", "[redacted]")
-      .slice(0, 1200);
-  }
-
-  async function lookupSpotifyTrack(url) {
-    // Spotify links supply metadata, not directly playable audio.
-    const match = new URL(url);
-    if (!/^\/track\//.test(match.pathname)) {
-      throw new Error("Only Spotify track links are supported for now (not playlists or albums).");
-    }
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    try {
-      const res = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, {
-        signal: controller.signal
-      });
-      if (!res.ok) throw new Error(`Spotify track metadata returned HTTP ${res.status}`);
-      const data = await res.json();
-      if (!data?.title) throw new Error("Spotify did not provide a track title.");
-      return `${data.title} ${data.author_name || ""}`.trim();
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  async function resolveTrack(node, userQuery) {
-    let query = userQuery.trim();
-    let isDirectUrl = false;
-    if (/^https?:\/\//i.test(query)) {
-      const u = new URL(query);
-      const host = u.hostname.toLowerCase();
-      if (host === "open.spotify.com" || host === "spotify.link") {
-        if (host === "spotify.link") {
-          // Explicitly require full track URLs to avoid following arbitrary redirects.
-          throw new Error("Please paste a full open.spotify.com/track/... link instead of a shortened Spotify link.");
-        }
-        query = await lookupSpotifyTrack(query);
-      } else if (host === "youtube.com" || host === "www.youtube.com" || host === "music.youtube.com" || host === "youtu.be") {
-        isDirectUrl = true;
-      } else {
-        throw new Error("Use a song name, YouTube URL, or Spotify track URL.");
-      }
-    }
-
-    const identifiers = isDirectUrl ? [query] : [`ytsearch:${query}`, `scsearch:${query}`];
-    const failures = [];
-    for (const id of identifiers) {
-      try {
-        const result = await node.rest.resolve(id);
-        if (result?.loadType === "error") {
-          failures.push(result.data?.message || `Source rejected ${id.split(':')[0]}`);
-          continue;
-        }
-        let track;
-        if (result?.loadType === "search" || result?.loadType === "playlist") {
-          track = result.data?.tracks?.[0] || result.data?.[0];
-        } else if (result?.loadType === "track") {
-          track = result.data;
-        }
-        if (track?.encoded && track?.info) return track;
-      } catch (error) {
-        failures.push(sanitizeError(error));
-      }
-    }
-    throw new Error(
-      `No playable track found. ${failures.length ? failures.join("; ").slice(0, 600) : "Both YouTube and SoundCloud searches returned no results."}`
-    );
-  }
-
-  function trackEmbed(track, title, user) {
-    const info = track.info || {};
-    const embed = new EmbedBuilder()
-      .setColor(0x5865f2)
-      .setTitle(title)
-      .setDescription(info.uri ? `[${String(info.title || "Unknown").slice(0, 160)}](${info.uri})` : String(info.title || "Unknown"))
-      .addFields(
-        { name: "Artist", value: String(info.author || "Unknown").slice(0, 100), inline: true },
-        { name: "Length", value: info.length ? `${Math.floor(info.length / 60000)}:${String(Math.floor((info.length % 60000) / 1000)).padStart(2, "0")}` : "Unknown", inline: true }
-      )
-      .setFooter({ text: `Requested by ${user.username}` });
-    if (info.artworkUrl) embed.setThumbnail(info.artworkUrl);
-    return embed;
-  }
-
-  async function nextTrack(guildId) {
-    const state = sessions.get(guildId);
-    if (!state || state.switching || state.stopping) return;
-    const next = state.queue.shift();
-    if (!next) {
-      state.current = null;
-      return;
-    }
-    state.switching = true;
-    state.current = next;
-    try {
-      await state.player.playTrack({ track: { encoded: next.encoded } });
-      console.log(`[Lavalink] Play request accepted: ${next.info?.title || "unknown"}`);
-    } catch (error) {
-      console.error("[Lavalink] playTrack failed:", sanitizeError(error));
-      state.current = null;
-      state.switching = false;
-      await nextTrack(guildId);
-      return;
-    }
-    state.switching = false;
-  }
-
-  function attachPlayerEvents(state) {
-    const player = state.player;
-    player.on("start", () => {
-      console.log(`[Lavalink] Track started in ${state.guildId}: ${state.current?.info?.title || "unknown"}`);
-    });
-    player.on("end", event => {
-      console.log(`[Lavalink] Track ended in ${state.guildId}: ${event?.reason || "unknown"}`);
-      if (state.stopping || event?.reason === "replaced") return;
-      state.current = null;
-      void nextTrack(state.guildId);
-    });
-    player.on("exception", event => {
-      console.error(`[Lavalink] Track exception in ${state.guildId}:`, event?.exception?.message || event);
-    });
-    player.on("stuck", event => {
-      console.error(`[Lavalink] Track stuck in ${state.guildId}:`, event?.thresholdMs || event);
-    });
-    player.on("closed", (data) => {
-      console.warn(`[Lavalink] Voice connection closed in ${state.guildId}:`, data);
-    });
+    console.log("[DisTube trial] bebot music test enabled. Other commands unchanged.");
+    void init().catch(() => {});
   }
 
   async function play(interaction) {
-    if (!interaction.guild) {
-      await interaction.reply({ content: "Use `/play` inside a server.", ephemeral: true });
-      return;
-    }
+    if (!interaction.inGuild()) return interaction.reply({ content: "Use `/play` in your Discord server.", ephemeral: true });
     const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
     const voice = member?.voice?.channel;
-    if (!voice) {
-      await interaction.reply({ content: "🎧 Join a voice channel first.", ephemeral: true });
-      return;
-    }
+    if (!voice) return interaction.reply({ content: "🎧 Join a voice channel first.", ephemeral: true });
     const me = interaction.guild.members.me || await interaction.guild.members.fetchMe().catch(() => null);
-    const permissions = me && voice.permissionsFor(me);
-    if (!permissions?.has(PermissionFlagsBits.Connect) || !permissions?.has(PermissionFlagsBits.Speak)) {
-      await interaction.reply({ content: "I need **Connect** and **Speak** permissions in your voice channel.", ephemeral: true });
-      return;
+    const perms = me && voice.permissionsFor(me);
+    if (!perms?.has(PermissionFlagsBits.Connect) || !perms?.has(PermissionFlagsBits.Speak)) {
+      return interaction.reply({ content: "bebot needs **Connect** and **Speak** permissions in your voice channel.", ephemeral: true });
+    }
+    const query = interaction.options.getString("query", true).trim();
+    if (!query) return interaction.reply({ content: "Please provide a YouTube URL or song title.", ephemeral: true });
+    if (/^https?:\/\//i.test(query)) {
+      let hostname = "";
+      try { hostname = new URL(query).hostname.toLowerCase(); } catch { /* invalid URL */ }
+      if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"].includes(hostname)) {
+        return interaction.reply({ content: "During this test, `/play` accepts **YouTube URLs or song titles only**. Spotify/SoundCloud will be added after the audio test succeeds.", ephemeral: true });
+      }
     }
     await interaction.deferReply();
     try {
-      const node = bestNode();
-      if (!node) {
-        throw new Error(`Lavalink is not connected yet. ${lastConnectionError || "Check the Lavalink server logs."}`);
-      }
-      const query = interaction.options.getString("query", true);
-      const track = await resolveTrack(node, query);
-      let state = sessions.get(interaction.guildId);
-      if (state && state.channelId !== voice.id) {
+      const player = await init();
+      const current = player.getQueue(interaction.guildId);
+      if (current && current.voiceChannel?.id !== voice.id) {
         throw new Error("Music is already active in another voice channel. Use `/stop` there first.");
       }
-      if (!state) {
-        const player = await shoukaku.joinVoiceChannel({
-          guildId: interaction.guildId,
-          channelId: voice.id,
-          shardId: interaction.guild.shardId,
-          deaf: true
-        });
-        state = {
-          guildId: interaction.guildId,
-          channelId: voice.id,
-          player,
-          queue: [],
-          current: null,
-          switching: false,
-          stopping: false
-        };
-        sessions.set(interaction.guildId, state);
-        attachPlayerEvents(state);
-      }
-      const queued = Boolean(state.current || state.switching || state.queue.length);
-      state.queue.push(track);
-      if (!queued) await nextTrack(state.guildId);
-      await interaction.editReply({
-        embeds: [trackEmbed(track, queued ? "🎵 Added to Queue" : "🎶 Sent to Lavalink", interaction.user)]
+      cancelIdle(interaction.guildId);
+      console.log(`[DisTube trial] /play requested for guild ${interaction.guildId}: ${query.slice(0, 120)}`);
+      await player.play(voice, query, {
+        member,
+        textChannel: interaction.channel,
+        metadata: { guildId: interaction.guildId, requesterId: interaction.user.id }
       });
+      const q = player.getQueue(interaction.guildId);
+      const song = q?.songs?.at(-1);
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle("🎵 DisTube Playback Test")
+        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"))
+        .addFields({ name: "Source", value: "YouTube via yt-dlp (SoundCloud fallback OFF)" })
+        .setFooter({ text: "Confirm that audio plays to the end; check Railway logs if it fails." });
+      await interaction.editReply({ embeds: [embed] });
     } catch (error) {
-      console.error("[Lavalink] /play:", sanitizeError(error));
-      await interaction.editReply(`❌ Music error: ${sanitizeError(error)}`);
+      console.error("[DisTube trial] /play error:", redact(error));
+      await interaction.editReply(`❌ Music test failed: ${redact(error)}\nNo SoundCloud preview was substituted.`);
     }
   }
 
   async function stop(interaction) {
-    if (!interaction.guild) {
-      await interaction.reply({ content: "Use `/stop` inside a server.", ephemeral: true });
-      return;
-    }
-    const state = sessions.get(interaction.guildId);
-    if (!state) {
-      await interaction.reply({ content: "There's no active music session here.", ephemeral: true });
-      return;
-    }
-    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-    const allowed = member?.voice?.channelId === state.channelId ||
-      interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-    if (!allowed) {
-      await interaction.reply({ content: "Join the bot's voice channel to stop it (or use **Manage Server** permission).", ephemeral: true });
-      return;
-    }
+    if (!interaction.inGuild()) return interaction.reply({ content: "Use `/stop` inside your server.", ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
-    state.stopping = true;
-    state.queue.length = 0;
-    sessions.delete(interaction.guildId);
     try {
-      await shoukaku.leaveVoiceChannel(interaction.guildId);
-      await interaction.editReply("⏹️ Stopped the music and left the voice channel.");
+      const player = distube;
+      if (!player) return interaction.editReply(startupError ? `Audio engine unavailable: ${startupError}` : "No music session is active.");
+      const queue = player.getQueue(interaction.guildId);
+      const voiceSession = player.voices.get(interaction.guildId);
+      if (!queue && !voiceSession) return interaction.editReply("No music session is active.");
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const allowed = member?.voice?.channelId === (queue?.voiceChannel?.id || voiceSession?.channelId) ||
+        interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+      if (!allowed) return interaction.editReply("Join the bot's voice channel or have **Manage Server** permission.");
+      cancelIdle(interaction.guildId);
+      if (queue) await queue.stop();
+      player.voices.leave(interaction.guildId);
+      return interaction.editReply("⏹️ Stopped music and disconnected.");
     } catch (error) {
-      await interaction.editReply(`❌ Could not disconnect: ${sanitizeError(error)}`);
+      console.error("[DisTube trial] /stop error:", redact(error));
+      return interaction.editReply(`❌ Could not stop playback: ${redact(error)}`);
     }
   }
 
-  return { logStatus, play, stop };
+  return { init, logStatus, play, stop };
 }

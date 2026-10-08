@@ -4,3 +4,7 @@ node_modules/
 !.env.example
 npm-debug.log*
 .DS_Store
+
+# MusicBot test audio helper binaries, cache and sessions
+beatra_engine/bin/
+beatra_engine/data/

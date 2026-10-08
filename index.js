@@ -152,7 +152,7 @@ async function registerCommands() {
   }
 }
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Serving ${client.guilds.cache.size} server(s).`);
   await registerCommands();
@@ -398,7 +398,7 @@ client.on("interactionCreate", async interaction => {
           "`/uptime` — Show bot uptime",
           "`/botinfo` — Show bot information",
           "`/help` — Show this list",
-          "`/play <query>` — Search or play a track through Lavalink",
+          "`/play <query>` — Test YouTube audio through DisTube + yt-dlp",
           "`/stop` — Stop playback and disconnect from voice",
           "`/sticky <message>` — Moderator: keep a message at the bottom of the channel",
           "`/unsticky` — Moderator: remove the channel sticky",
