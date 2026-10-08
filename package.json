@@ -9,17 +9,11 @@
     "deploy-commands": "node register-commands.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=20"
   },
   "dependencies": {
-    "@discordjs/voice": "latest",
-    "@distube/ytdl-core": "latest",
-    "@snazzah/davey": "latest",
     "discord.js": "^14.19.3",
     "dotenv": "^16.5.0",
-    "ffmpeg-static": "^5.2.0",
-    "libsodium-wrappers": "latest",
-    "opusscript": "latest",
-    "yt-search": "latest"
+    "shoukaku": "^4.1.1"
   }
 }
