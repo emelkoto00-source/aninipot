@@ -1,10 +1,44 @@
 import { createRequire } from "node:module";
 import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
 
-// Temporary YouTube-only replacement for bebot's existing Shoukaku music manager.
+// DisTube/yt-dlp engine replacing bebot's former Shoukaku music manager.
 // Extractor and relay code is from the user's uploaded MIT-licensed MusicBot/Beatra.
-// No SoundCloud auto-fallback: source failures must be visible during this test.
+// Spotify resolves titles/playlists; YouTube/yt-dlp supplies audio. No SoundCloud fallback.
 const require = createRequire(import.meta.url);
+const MAX_SPOTIFY_PLAYLIST_TRACKS = 100;
+
+// Use only explicit Spotify track/playlist URLs, stripping share-tracking parameters.
+// Validating before passing a URL to DisTube also produces a clearer error for users.
+function parseMusicQuery(input) {
+  const value = String(input || "").trim();
+  const spotifyUri = /^spotify:(track|playlist):([a-zA-Z0-9]{22})$/i.exec(value);
+  if (spotifyUri) return {
+    query: `https://open.spotify.com/${spotifyUri[1].toLowerCase()}/${spotifyUri[2]}`,
+    kind: spotifyUri[1].toLowerCase()
+  };
+  if (!/^https?:\/\//i.test(value)) return { query: value, kind: "search" };
+  let url;
+  try { url = new URL(value); } catch { throw new Error("That music URL isn't valid."); }
+  const host = url.hostname.toLowerCase();
+  if (host === "open.spotify.com" || host === "play.spotify.com") {
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (/^intl-[a-z-]+$/i.test(segments[0] || "")) segments.shift();
+    const [kind, id] = segments;
+    if (!["track", "playlist"].includes(kind) || !/^[a-zA-Z0-9]{22}$/.test(id || "")) {
+      throw new Error("Use a Spotify song or playlist link from Share → Copy link.");
+    }
+    return { query: `https://open.spotify.com/${kind}/${id}`, kind };
+  }
+  if (["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"].includes(host)) {
+    return { query: value, kind: "youtube" };
+  }
+  throw new Error("Supported links: Spotify songs/playlists and YouTube videos/playlists.");
+}
+
+function markdownTitle(text) {
+  return String(text || "Unknown song").replace(/([\\[\]()*_`~])/g, "\\$1").slice(0, 180);
+}
+
 
 export function createMusicManager(client) {
   let distube = null;
@@ -53,9 +87,15 @@ export function createMusicManager(client) {
       }
       console.log("[DisTube trial] Executables ready. YouTube fallback: DISABLED.");
       const { DisTube, Events } = require("distube");
+      const { SpotifyPlugin } = require("@distube/spotify");
       const { YouTubePlugin } = require("./beatra_engine/src/music/plugins.js");
+      const spotifyOptions = process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET
+        ? { api: { clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET } }
+        : {};
       const instance = new DisTube(client, {
-        plugins: [new YouTubePlugin({ fallback: null })],
+        // Original MusicBot plugin order: the playable YouTube extractor precedes Spotify.
+        // Spotify resolves titles/playlist metadata; YouTube fetches actual audio.
+        plugins: [new YouTubePlugin({ fallback: null }), new SpotifyPlugin(spotifyOptions)],
         emitAddSongWhenCreatingQueue: false,
         emitAddListWhenCreatingQueue: false,
         joinNewVoiceChannel: false,
@@ -91,7 +131,7 @@ export function createMusicManager(client) {
       }
       distube = instance;
       startupError = null;
-      console.log("[DisTube trial] Ready. Lavalink is not used by this build.");
+      console.log("[DisTube trial] Ready. Spotify links enabled; audio via YouTube/yt-dlp; SoundCloud fallback OFF.");
       return instance;
     })().catch(err => {
       startupError = redact(err);
@@ -117,15 +157,12 @@ export function createMusicManager(client) {
     if (!perms?.has(PermissionFlagsBits.Connect) || !perms?.has(PermissionFlagsBits.Speak)) {
       return interaction.reply({ content: "bebot needs **Connect** and **Speak** permissions in your voice channel.", ephemeral: true });
     }
-    const query = interaction.options.getString("query", true).trim();
-    if (!query) return interaction.reply({ content: "Please provide a YouTube URL or song title.", ephemeral: true });
-    if (/^https?:\/\//i.test(query)) {
-      let hostname = "";
-      try { hostname = new URL(query).hostname.toLowerCase(); } catch { /* invalid URL */ }
-      if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be"].includes(hostname)) {
-        return interaction.reply({ content: "During this test, `/play` accepts **YouTube URLs or song titles only**. Spotify/SoundCloud will be added after the audio test succeeds.", ephemeral: true });
-      }
-    }
+    const rawQuery = interaction.options.getString("query", true).trim();
+    if (!rawQuery) return interaction.reply({ content: "Provide a song name, YouTube link, or Spotify track/playlist link.", ephemeral: true });
+    let request;
+    try { request = parseMusicQuery(rawQuery); }
+    catch (error) { return interaction.reply({ content: `❌ ${redact(error)}`, ephemeral: true }); }
+
     await interaction.deferReply();
     try {
       const player = await init();
@@ -134,24 +171,63 @@ export function createMusicManager(client) {
         throw new Error("Music is already active in another voice channel. Use `/stop` there first.");
       }
       cancelIdle(interaction.guildId);
-      console.log(`[DisTube trial] /play requested for guild ${interaction.guildId}: ${query.slice(0, 120)}`);
-      await player.play(voice, query, {
+      const spotifyRequest = request.kind === "track" || request.kind === "playlist";
+      console.log(`[DisTube trial] /play requested for guild ${interaction.guildId}: ${request.query.slice(0, 120)}`);
+      const playOptions = {
         member,
         textChannel: interaction.channel,
         metadata: { guildId: interaction.guildId, requesterId: interaction.user.id }
-      });
-      const q = player.getQueue(interaction.guildId);
-      const song = q?.songs?.at(-1);
+      };
+
+      // Resolve Spotify once so playlist name and song count are accurate, then
+      // hand the resolved object directly to DisTube (as in the Beatra reference).
+      // Preserve the proven direct YouTube path for non-Spotify queries.
+      let resolved = null;
+      let omitted = 0;
+      if (spotifyRequest) {
+        const { Playlist } = require("distube");
+        resolved = await player.handler.resolve(request.query, playOptions);
+        if (!resolved) throw new Error("Spotify couldn't find this song or playlist.");
+        if (request.kind === "playlist") {
+          if (!(resolved instanceof Playlist)) throw new Error("Spotify did not return a playable playlist.");
+          omitted = Math.max(0, resolved.songs.length - MAX_SPOTIFY_PLAYLIST_TRACKS);
+          if (omitted) resolved.songs = resolved.songs.slice(0, MAX_SPOTIFY_PLAYLIST_TRACKS);
+          if (!resolved.songs.length) throw new Error("That Spotify playlist has no available songs.");
+        }
+        await player.play(voice, resolved, playOptions);
+      } else {
+        await player.play(voice, request.query, playOptions);
+      }
+
+      const queue = player.getQueue(interaction.guildId);
+      const pending = queue?.songs?.at(-1);
+      const isPlaylist = request.kind === "playlist";
+      const spotifyUrl = spotifyRequest ? request.query : null;
+      let description;
+      if (isPlaylist) {
+        const count = resolved.songs.length;
+        description = `🎶 **Added Spotify playlist** [${markdownTitle(resolved.name || "Playlist")}](${spotifyUrl})\n` +
+          `**${count} songs** added to the queue.` +
+          (omitted ? `\nLimited to ${MAX_SPOTIFY_PLAYLIST_TRACKS} songs per request (${omitted} omitted).` : "");
+      } else if (spotifyRequest) {
+        const label = markdownTitle(resolved.name || "Spotify track");
+        description = `${current ? "🎶 Queued" : "▶️ Started playing"} **[${label}](${spotifyUrl})**`;
+      } else {
+        description = pending?.url
+          ? `${current ? "🎶 Queued" : "▶️ Started playing"} **[${markdownTitle(pending.name)}](${pending.url})**`
+          : "🎶 Music request submitted";
+      }
       const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setTitle("🎵 DisTube Playback Test")
-        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"))
-        .addFields({ name: "Source", value: "YouTube via yt-dlp (SoundCloud fallback OFF)" })
-        .setFooter({ text: "Confirm that audio plays to the end; check Railway logs if it fails." });
+        .setColor(spotifyRequest ? 0x1db954 : 0x5865f2)
+        .setDescription(description)
+        .addFields({ name: "Audio", value: "YouTube via yt-dlp • SoundCloud fallback off" });
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       console.error("[DisTube trial] /play error:", redact(error));
-      await interaction.editReply(`❌ Music test failed: ${redact(error)}\nNo SoundCloud preview was substituted.`);
+      const explanation = request.kind === "playlist"
+        ? "If the playlist is large or private, it may need Spotify API credentials or a public playlist link."
+        : "The music source may be unavailable; no SoundCloud preview was substituted.";
+      await interaction.editReply(`❌ Couldn't play that link: ${redact(error)}\n${explanation}`);
     }
   }
 
