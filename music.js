@@ -58,11 +58,14 @@ export function createMusicManager(client) {
       }
       console.log("[DisTube] Executables ready. YouTube first, SoundCloud preview guard enabled.");
       const { DisTube, Events } = require("distube");
-      const { YouTubePlugin } = require("./beatra_engine/src/music/plugins.js");
+      const { YouTubePlugin, RelayedSoundCloudPlugin, relayStream } = require("./beatra_engine/src/music/plugins.js");
       const { SoundCloudPlugin } = require("@distube/soundcloud");
-      // The original Beatra YouTubePlugin can use a SoundCloudPlugin as a fallback.
-      // Reject the identifiable /preview/ streams that previously cut songs to ~30s.
-      const soundcloud = new SoundCloudPlugin();
+      const { proxyFor } = require("./beatra_engine/src/music/ytdlp.js");
+      // CRITICAL: Beatra's relay is required for SoundCloud too. The plain
+      // SoundCloudPlugin returned a remote HLS URL directly to FFmpeg; on some
+      // sources FFmpeg would finish immediately without delivering any audio.
+      // Keep the full-length preview filter before passing the URL to the relay.
+      const soundcloud = new RelayedSoundCloudPlugin();
       const originalSearchSong = soundcloud.searchSong.bind(soundcloud);
       soundcloud.searchSong = async (...args) => {
         const candidate = await originalSearchSong(...args);
@@ -72,18 +75,24 @@ export function createMusicManager(client) {
         }
         return candidate;
       };
-      const originalGetStreamURL = soundcloud.getStreamURL.bind(soundcloud);
+      // Call the underlying SoundCloud API before the relay wrapper so preview
+      // URLs can be rejected, then stream actual bytes through yt-dlp's relay.
       soundcloud.getStreamURL = async song => {
-        const result = await originalGetStreamURL(song);
+        const result = await SoundCloudPlugin.prototype.getStreamURL.call(soundcloud, song);
         const streamUrl = typeof result === 'string' ? result : (result?.url || '');
         if (typeof streamUrl !== 'string' || !/^https?:\/\//i.test(streamUrl)) {
-          throw new Error('SoundCloud did not provide a supported full-track stream URL.');
+          throw new Error('SoundCloud did not provide a supported media URL.');
         }
         if (/(?:\/|%2f)preview(?:\/|%2f|\?|$)/i.test(streamUrl) || /(?:[?&]type=preview)/i.test(streamUrl)) {
           console.warn('[DisTube] Rejected preview-only SoundCloud stream:', song?.name || 'unknown');
-          throw new Error('SoundCloud provided only a preview clip; refusing to play it as a full song.');
+          throw new Error('SoundCloud provided a preview clip, not the full track.');
         }
-        return result;
+        const guildId = song?.metadata?.guildId || song?.member?.guild?.id || null;
+        // relayStream waits for media bytes. If the download fails or only
+        // returns HTTP 403, /play fails instead of reporting a silent start.
+        const relayUrl = await relayStream(soundcloud.relay, { url: streamUrl, proxy: proxyFor(guildId) });
+        console.log(`[DisTube] SoundCloud audio relay ready: ${String(song?.name || 'track').slice(0, 120)}`);
+        return relayUrl;
       };
       const instance = new DisTube(client, {
         plugins: [new YouTubePlugin({ fallback: soundcloud }), soundcloud],
@@ -180,11 +189,9 @@ export function createMusicManager(client) {
       }
       const song = q?.songs?.at(-1);
       const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setTitle("🎵 DisTube Playback Test")
-        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"))
-        .addFields({ name: "Source", value: "YouTube via yt-dlp (SoundCloud fallback OFF)" })
-        .setFooter({ text: "Confirm that audio plays to the end; check Railway logs if it fails." });
+        .setColor(0xED91CF)
+        .setTitle("🎵 Music Requested")
+        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"));
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       console.error("[DisTube trial] /play error:", redact(error));
