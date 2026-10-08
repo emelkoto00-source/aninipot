@@ -153,12 +153,25 @@ export function createMusicManager(client) {
         q.toggleAutoplay();
       }
       const song = q?.songs?.at(-1);
+      // Presentation only; do not alter the working extractor or playback flow.
+      const isQueued = Boolean(q?.songs?.length > 1);
+      const trackName = String(song?.name || "Music request submitted")
+        .replace(/[\r\n]+/g, " ").slice(0, 180);
+      const safeName = trackName.replace(/[\\[\]()*_~`]/g, "\\$&");
+      const trackUrl = typeof song?.url === "string" && /^https?:\/\//i.test(song.url)
+        ? song.url.replace(/\)/g, "%29") : null;
+      const titleLine = trackUrl ? `**[${safeName}](${trackUrl})**` : `**${safeName}**`;
+      const uploaderValue = song?.uploader?.name || song?.uploader || song?.artist || song?.author;
+      const artistLine = typeof uploaderValue === "string"
+        ? uploaderValue.replace(/[\r\n]+/g, " ").slice(0, 90) : "";
+      const durationLine = song?.formattedDuration ? `⏱️ ${song.formattedDuration}` : "";
+      const details = [titleLine, artistLine, durationLine].filter(Boolean).join("\n");
       const embed = new EmbedBuilder()
-        .setColor(0x5865f2)
-        .setTitle("🎵 DisTube Playback Test")
-        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"))
-        .addFields({ name: "Source", value: "YouTube via yt-dlp (SoundCloud fallback OFF)" })
-        .setFooter({ text: "Confirm that audio plays to the end; check Railway logs if it fails." });
+        .setColor(0xED91CF)
+        .setTitle(isQueued ? "🎶 Added to Queue" : "🎶 Now Playing")
+        .setDescription(details);
+      const thumbnail = typeof song?.thumbnail === "string" ? song.thumbnail : "";
+      if (/^https?:\/\//i.test(thumbnail)) embed.setThumbnail(thumbnail);
       await interaction.editReply({ embeds: [embed] });
     } catch (error) {
       console.error("[DisTube trial] /play error:", redact(error));
