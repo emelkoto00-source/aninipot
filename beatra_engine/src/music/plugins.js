@@ -134,6 +134,7 @@ class YtDlpBase {
         });
         this.infos.set(key, info, streamTtl(info.url));
         signalOf(song)?.throwIfAborted();
+        if (song.exactVideoId && info.id !== song.exactVideoId) throw new DisTubeError('INVALID_SONG', 'Video identity did not match the requested link');
         return info;
     }
 
@@ -161,6 +162,7 @@ class YouTubePlugin extends ExtractorPlugin {
         this.fallback = fallback;
         this.recommendations = recommendations;
         this.getQueue = getQueue;
+        this.rejectedRecommendations = new TTLCache({ ttlMs: 10 * 60_000, maxSize: 1000 });
         // When YouTube refuses streams again and again (blocked server IP), stop trying it first
         // for a while so every song does not pay for a failed attempt.
         this.streamFailures = 0;
@@ -207,7 +209,9 @@ class YouTubePlugin extends ExtractorPlugin {
         // One call returns metadata *and* the stream URL, so playback can start right away.
         const info = await this.run(watchUrl(parsed.id), ['--no-playlist', '-f', AUDIO_FORMAT], { proxy, signal: signalOf(options) });
         signalOf(options)?.throwIfAborted();
+        if (info?.id !== parsed.id) throw new DisTubeError('INVALID_SONG', 'Video identity did not match the requested link');
         const song = new Song({ ...youtubeInfo(info), plugin: this }, options);
+        song.exactVideoId = parsed.id;
         this.base.rememberInfo(guildId, song.url, info);
         return song;
     }
@@ -282,7 +286,7 @@ class YouTubePlugin extends ExtractorPlugin {
         // DisTube asks the plugin that answered the search; a SoundCloud fallback song plays through its own plugin.
         if (song.plugin && song.plugin !== this) return song.plugin.getStreamURL(song);
         try {
-            if (this.fallback && Date.now() < this.skipYouTubeUntil) {
+            if (!song.exactVideoId && this.fallback && Date.now() < this.skipYouTubeUntil) {
                 throw new Error('YouTube streams are paused after repeated failures');
             }
             const url = await this.base.streamUrl(song);
@@ -292,6 +296,7 @@ class YouTubePlugin extends ExtractorPlugin {
             if (signalOf(song)?.aborted) throw signalOf(song).reason;
             // A cached search contains signed media too. Never reuse it after a failed stream.
             this.searches.clear();
+            if (song.exactVideoId) throw error;
             if (!this.fallback) throw error;
             if (Date.now() >= this.skipYouTubeUntil && ++this.streamFailures >= BLOCKED_AFTER_FAILURES) {
                 this.streamFailures = 0;
@@ -337,7 +342,37 @@ class YouTubePlugin extends ExtractorPlugin {
             .filter((entry) => entry?.id && entry.id !== song.id && VIDEO_ID.test(entry.id))
             .filter((entry) => !entry.duration || (entry.duration >= 60 && entry.duration <= 900))
             .map((entry) => new Song({ ...youtubeInfo(entry), plugin: this }, { member: song.member, metadata: song.metadata }));
-        return this.recommendations.select(guildId, candidates, song, this.getQueue(guildId));
+        const fresh = this.recommendations.select(guildId, candidates, song, this.getQueue(guildId))
+            .filter(candidate => !this.rejectedRecommendations.has(`${guildId}|${candidate.id}`));
+        // Flat mix entries prove only that a video exists, not that its audio
+        // can be retrieved. Check a bounded number before DisTube selects one.
+        // This applies ONLY to autoplay, never to an explicit video request.
+        for (const candidate of fresh.slice(0, 3)) {
+            signalOf(song)?.throwIfAborted();
+            const timeout = AbortSignal.timeout(8000);
+            const parent = signalOf(song);
+            const signal = parent ? AbortSignal.any([parent, timeout]) : timeout;
+            const fields = { source: 'youtube', stage: 'autoplay_candidate' };
+            try {
+                const info = await this.run(watchUrl(candidate.id), ['--no-playlist', '-f', AUDIO_FORMAT],
+                    { proxy: ytdlp.proxyFor(guildId), priority: 'low', signal, timeoutMs: 8000 });
+                signal.throwIfAborted();
+                if (info?.id !== candidate.id || !info?.url || !info?.format_id) {
+                    throw new DisTubeError('NO_STREAM_URL', 'Autoplay candidate has no confirmed audio format');
+                }
+                const selected = new Song({ ...youtubeInfo(info), plugin: this }, { member: song.member, metadata: song.metadata });
+                if (selected.isLive || selected.duration < 60 || selected.duration > 900 ||
+                    !this.recommendations.select(guildId, [selected], song, this.getQueue(guildId)).length) continue;
+                this.base.rememberInfo(guildId, selected.url, info);
+                diagnostic('playback', { ...fields, outcome: 'resolved' });
+                return [selected];
+            } catch (error) {
+                parent?.throwIfAborted();
+                this.rejectedRecommendations.set(`${guildId}|${candidate.id}`, true);
+                diagnostic('playback', { ...fields, outcome: 'failed', reason: classify(error) });
+            }
+        }
+        return [];
     }
 }
 

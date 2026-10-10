@@ -89,7 +89,16 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
       }, onDisconnect: queue => { cancelIdle(queue.id); sessions.release(queue.id); },
       onDeleteQueue: queue => { scheduleIdle(queue.id); sessions.release(queue.id); } });
       instance.on(Events.FINISH, queue => scheduleIdle(queue.id));
-      instance.on(Events.NO_RELATED, queue => diagnostic('playback', { stage: 'recommendations', outcome: 'unavailable' }));
+      instance.on(Events.NO_RELATED, queue => {
+        diagnostic('playback', { stage: 'recommendations', outcome: 'unavailable' });
+        const failed = () => diagnostic('playback', { stage: 'notification', outcome: 'failed', reason: 'NOTICE_FAILED' });
+        try {
+          Promise.resolve(queue?.textChannel?.send({
+            content: 'Autoplay could not load a fresh recommendation. Add a song with `/play`.',
+            allowedMentions: { parse: [] }
+          })).catch(failed);
+        } catch { failed(); }
+      });
       // Never subscribe raw DEBUG/FFMPEG_DEBUG messages: they contain source URLs/arguments.
       distube = instance;
       startupError = null;
