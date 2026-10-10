@@ -5,6 +5,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const config = require('../config');
+const { providerArgs } = require('../../../youtube_setup.cjs');
 const { Semaphore } = require('../core/cache');
 const log = require('../core/logger').createLogger('yt-dlp');
 
@@ -45,6 +46,7 @@ function baseArgs({ proxy = null, settings = config.ytdlp } = {}) {
         '--socket-timeout', '10',
         '--retries', '2',
         '--js-runtimes', `node:${process.execPath}`,
+        ...providerArgs(),
     ];
 
     if (settings.cookiesFile) args.push('--cookies', settings.cookiesFile);
