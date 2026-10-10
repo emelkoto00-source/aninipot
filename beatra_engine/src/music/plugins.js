@@ -9,6 +9,7 @@ const { getRelay } = require('./relay');
 const { TTLCache } = require('../core/cache');
 const log = require('../core/logger').createLogger('extractor');
 const { classify, event: diagnostic } = require('../core/diagnostics');
+const { RecentTracks } = require('./recommendations');
 
 const AUDIO_FORMAT = 'bestaudio[acodec=opus]/bestaudio/best';
 const YOUTUBE_HOSTS = new Set([
@@ -153,10 +154,13 @@ class YouTubePlugin extends ExtractorPlugin {
      * @param {object} [options]
      * @param {object} [options.fallback] SoundCloud plugin used when YouTube fails (null to disable).
      */
-    constructor({ runner = ytdlp.runJson, relay = getRelay(), fallback = null } = {}) {
+    constructor({ runner = ytdlp.runJson, relay = getRelay(), fallback = null,
+        recommendations = new RecentTracks(), getQueue = () => undefined } = {}) {
         super();
         this.base = new YtDlpBase(runner, relay);
         this.fallback = fallback;
+        this.recommendations = recommendations;
+        this.getQueue = getQueue;
         // When YouTube refuses streams again and again (blocked server IP), stop trying it first
         // for a while so every song does not pay for a failed attempt.
         this.streamFailures = 0;
@@ -326,12 +330,14 @@ class YouTubePlugin extends ExtractorPlugin {
         if (!VIDEO_ID.test(song?.id || '')) return [];
         const guildId = guildIdOf(song);
         const result = await this.run(`${watchUrl(song.id)}&list=RD${song.id}`, [
-            '--flat-playlist', '--playlist-end', '15',
+            '--flat-playlist', '--playlist-end', '40',
         ], { proxy: ytdlp.proxyFor(guildId), priority: 'low', signal: signalOf(song) });
-        return (result?.entries || [])
+        signalOf(song)?.throwIfAborted();
+        const candidates = (result?.entries || [])
             .filter((entry) => entry?.id && entry.id !== song.id && VIDEO_ID.test(entry.id))
             .filter((entry) => !entry.duration || (entry.duration >= 60 && entry.duration <= 900))
             .map((entry) => new Song({ ...youtubeInfo(entry), plugin: this }, { member: song.member, metadata: song.metadata }));
+        return this.recommendations.select(guildId, candidates, song, this.getQueue(guildId));
     }
 }
 

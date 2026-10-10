@@ -30,7 +30,6 @@ function requester(song) {
 }
 function baseEmbed(song, heading) {
   const embed = new EmbedBuilder().setColor(COLOR)
-    .setAuthor({ name: 'bebot • music' })
     .setTitle(heading).setDescription(trackLink(song));
   const thumbnail = webUrl(song?.thumbnail);
   if (thumbnail) embed.setThumbnail(thumbnail);
@@ -39,25 +38,13 @@ function baseEmbed(song, heading) {
 export function buildNowPlayingEmbed(queue, song, { snapshot = false } = {}) {
   const embed = baseEmbed(song, queue?.paused ? '⏸ Paused' : '♫ Now Playing');
   const duration = song?.isLive ? 'LIVE' : Number(song?.duration) > 0 ? formatTime(song.duration) : 'Unknown';
-  const voiceId = queue?.voiceChannel?.id;
-  const waiting = Math.max(0, (queue?.songs?.length || 1) - 1);
-  const source = ({ youtube: 'YouTube', soundcloud: 'SoundCloud' })[song?.source] || text(song?.source || 'Music');
-  embed.addFields(
-    { name: snapshot && !song?.isLive ? 'Position' : 'Duration', value: snapshot && !song?.isLive ? `${formatTime(queue?.currentTime)} / ${duration}` : duration, inline: true },
-    { name: 'Requested by', value: requester(song), inline: true },
-    { name: 'Voice channel', value: /^\d{17,20}$/.test(String(voiceId)) ? `<#${voiceId}>` : 'Voice chat', inline: true },
-    { name: 'Source', value: source, inline: true },
-    { name: 'Queue', value: `${waiting} waiting`, inline: true },
-    { name: 'Autoplay', value: queue?.autoplay ? 'On' : 'Off', inline: true }
-  );
-  if (queue?.songs?.[1]) embed.addFields({ name: 'Up next', value: trackLink(queue.songs[1]) });
-  return embed.setFooter({ text: snapshot ? 'Playback snapshot • /queue to see upcoming tracks' : 'Track started • /queue · /skip · /pause' });
+  const position = snapshot && !song?.isLive ? `${formatTime(queue?.currentTime)} / ${duration}` : duration;
+  return embed.setDescription(`${trackLink(song)}\n${position} · ${requester(song)}`);
 }
 export function buildRequestEmbed(song, { count = 1 } = {}) {
-  return baseEmbed(song, '✓ Music Requested').addFields(
-    { name: 'Duration', value: song?.isLive ? 'LIVE' : Number(song?.duration) > 0 ? formatTime(song.duration) : 'Unknown', inline: true },
-    { name: 'Requested by', value: requester(song), inline: true }
-  ).setFooter({ text: count > 1 ? `${count} tracks requested • New tracks are announced when they start` : 'New tracks are announced when they start' });
+  const duration = song?.isLive ? 'LIVE' : Number(song?.duration) > 0 ? formatTime(song.duration) : 'Unknown';
+  return baseEmbed(song, '✓ Music Requested')
+    .setDescription(`${trackLink(song)}\n${duration} · ${requester(song)}${count > 1 ? ` · ${count} tracks` : ''}`);
 }
 
 // Presentation only: never await this from the player's event callback.

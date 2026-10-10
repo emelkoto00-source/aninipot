@@ -8,8 +8,9 @@ import { announceNowPlaying, buildNowPlayingEmbed, buildRequestEmbed } from "./m
 
 // Music commands retain the existing DisTube engine with cancellable per-guild requests.
 const require = createRequire(import.meta.url);
+const { RecentTracks } = require('./beatra_engine/src/music/recommendations.js');
 
-export function createMusicManager(client, { engineFactory, statsFactory = createListeningStats } = {}) {
+export function createMusicManager(client, { engineFactory, statsFactory = createListeningStats, recommendations = new RecentTracks() } = {}) {
   let distube = null;
   let initialization = null;
   let startupError = null;
@@ -63,7 +64,8 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
         relay = require("./beatra_engine/src/music/relay.js").getRelay();
         const soundcloud = configureSoundCloud(new RelayedSoundCloudPlugin(), { relayStream, proxyFor });
         instance = new DisTube(client, {
-          plugins: [new YouTubePlugin({ fallback: config.youtubeFallback ? soundcloud : null }), soundcloud],
+          plugins: [new YouTubePlugin({ fallback: config.youtubeFallback ? soundcloud : null,
+            recommendations, getQueue: guildId => guildId ? distube?.getQueue(guildId) : undefined }), soundcloud],
           emitAddSongWhenCreatingQueue: false, emitAddListWhenCreatingQueue: false,
           joinNewVoiceChannel: false,
           ffmpeg: { path: ffmpegPath, args: { input: { reconnect: 0, reconnect_streamed: 0, reconnect_delay_max: null } } }
@@ -79,6 +81,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
         return channel?.send({ content, allowedMentions: { parse: [] } });
       }, onPlaySong: (queue, song) => {
         cancelIdle(queue.id);
+        recommendations.remember(queue.id, song);
         if (autoplayPreferences.has(queue.id) && Boolean(queue.autoplay) !== autoplayPreferences.get(queue.id)) {
           try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
         }
