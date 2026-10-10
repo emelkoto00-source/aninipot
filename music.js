@@ -4,6 +4,7 @@ import { createListeningStats } from "./music_stats.js";
 import { MusicSessions } from "./music_session.js";
 import { configureSoundCloud } from "./music_sources.js";
 import { instrumentMusic } from "./music_runtime.js";
+import { announceNowPlaying, buildNowPlayingEmbed, buildRequestEmbed } from "./music_embeds.js";
 
 // Music commands retain the existing DisTube engine with cancellable per-guild requests.
 const require = createRequire(import.meta.url);
@@ -81,6 +82,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
         if (autoplayPreferences.has(queue.id) && Boolean(queue.autoplay) !== autoplayPreferences.get(queue.id)) {
           try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
         }
+        void announceNowPlaying(queue, song, diagnostic);
       }, onDisconnect: queue => { cancelIdle(queue.id); sessions.release(queue.id); },
       onDeleteQueue: queue => { scheduleIdle(queue.id); sessions.release(queue.id); } });
       instance.on(Events.FINISH, queue => scheduleIdle(queue.id));
@@ -155,10 +157,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
         return result;
       });
       const song = resolved.songs?.[0] || resolved;
-      const embed = new EmbedBuilder()
-        .setColor(0xED91CF)
-        .setTitle("🎵 Music Requested")
-        .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"));
+      const embed = buildRequestEmbed(song, { count: resolved.songs?.length || 1 });
       await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
     } catch (error) {
       diagnostic('request', { stage: 'command', outcome: 'failed', reason: classify(error) });
@@ -260,8 +259,8 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
       if (command === 'nowplaying') {
         const song = queue?.songs?.[0];
         if (!song) return reply('Nothing is playing right now.');
-        const e = new EmbedBuilder().setColor(0xED91CF).setTitle('🎵 Now Playing').setDescription(song.url ? `[${String(song.name).replaceAll('[','\\[').replaceAll(']','\\]')}](${song.url})` : song.name).addFields({ name: 'Position', value: `${Math.floor(queue.currentTime || 0)}s / ${song.formattedDuration || 'unknown'}` }, { name: 'Queue', value: `${queue.songs.length} song(s)` });
-        return interaction.editReply({ embeds: [e] });
+        const e = buildNowPlayingEmbed(queue, song, { snapshot: true });
+        return interaction.editReply({ embeds: [e], allowedMentions: { parse: [], repliedUser: false } });
       }
       if (!player || (!queue && !['leave','stop'].includes(command))) return reply('No active song. Use `/play` first.');
       if (!channelId && command !== 'leave') return reply('No voice session is active.');
