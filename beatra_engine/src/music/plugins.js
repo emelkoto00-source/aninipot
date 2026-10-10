@@ -8,6 +8,7 @@ const ytdlp = require('./ytdlp');
 const { getRelay } = require('./relay');
 const { TTLCache } = require('../core/cache');
 const log = require('../core/logger').createLogger('extractor');
+const { classify, event: diagnostic } = require('../core/diagnostics');
 
 const AUDIO_FORMAT = 'bestaudio[acodec=opus]/bestaudio/best';
 const YOUTUBE_HOSTS = new Set([
@@ -20,6 +21,7 @@ const BLOCKED_PAUSE_MS = 10 * 60_000;
 
 // Every song carries its guild id in metadata so proxy selection never depends on a cached member.
 const guildIdOf = (holder) => holder?.metadata?.guildId || holder?.member?.guild?.id || null;
+const signalOf = holder => holder?._bebotSignal || holder?.metadata?.signal;
 
 /**
  * Seconds until a googlevideo URL expires (minus a safety margin), capped to 4 hours.
@@ -27,7 +29,7 @@ const guildIdOf = (holder) => holder?.metadata?.guildId || holder?.member?.guild
 function streamTtl(url) {
     try {
         const expire = Number(new URL(url).searchParams.get('expire'));
-        if (expire > 0) return Math.max(60_000, Math.min(4 * 3600_000, expire * 1000 - Date.now() - 30 * 60_000));
+        if (expire > 0) return Math.max(0, Math.min(4 * 3600_000, expire * 1000 - Date.now() - 30 * 60_000));
     } catch {
         // not a URL with an expiry
     }
@@ -93,7 +95,8 @@ function youtubeInfo(info) {
  */
 async function relayStream(relay, source) {
     const url = await relay.register(source);
-    return relay.warm(url);
+    try { return await relay.warm(url); }
+    catch (error) { relay.discard?.(url); throw error; }
 }
 
 /**
@@ -119,21 +122,29 @@ class YtDlpBase {
      * Full info of a song with its audio format chosen (cached, or extracted now).
      */
     async streamInfo(song, { priority = 'high' } = {}) {
+        signalOf(song)?.throwIfAborted();
         if (!song?.url) throw new DisTubeError('INVALID_SONG', 'Cannot get a stream without a song URL.');
         const guildId = guildIdOf(song);
         const key = this.infoKey(guildId, song.url);
         const info = await this.infos.wrap(key, async () => {
-            const result = await this.run(song.url, ['--no-playlist', '-f', AUDIO_FORMAT], { proxy: ytdlp.proxyFor(guildId), priority });
+            const result = await this.run(song.url, ['--no-playlist', '-f', AUDIO_FORMAT], { proxy: ytdlp.proxyFor(guildId), priority, signal: signalOf(song) });
             if (!result?.url) throw new DisTubeError('NO_STREAM_URL', song.name || song.url);
             return result;
         });
         this.infos.set(key, info, streamTtl(info.url));
+        signalOf(song)?.throwIfAborted();
         return info;
     }
 
     async streamUrl(song) {
         const info = await this.streamInfo(song);
-        return relayStream(this.relay, { info, proxy: ytdlp.proxyFor(guildIdOf(song)) });
+        try {
+            return await relayStream(this.relay, { info, proxy: ytdlp.proxyFor(guildIdOf(song)),
+                signal: signalOf(song), attemptId: song.metadata?.attemptId || song.metadata?.requestId });
+        } catch (error) {
+            this.infos.delete(this.infoKey(guildIdOf(song), song.url));
+            throw error;
+        }
     }
 }
 
@@ -164,6 +175,7 @@ class YouTubePlugin extends ExtractorPlugin {
     }
 
     async resolve(url, options = {}) {
+        signalOf(options)?.throwIfAborted();
         const parsed = parseYouTubeUrl(url);
         if (!parsed) throw new DisTubeError('NOT_SUPPORTED_URL');
         const guildId = guildIdOf(options);
@@ -172,7 +184,8 @@ class YouTubePlugin extends ExtractorPlugin {
         if (parsed.type === 'playlist') {
             const info = await this.run(`https://www.youtube.com/playlist?list=${parsed.id}`, [
                 '--flat-playlist', '--playlist-end', String(config.bot.maxPlaylistSize),
-            ], { proxy });
+            ], { proxy, signal: signalOf(options) });
+            signalOf(options)?.throwIfAborted();
             const songs = (info.entries || [])
                 .filter((entry) => entry?.id && VIDEO_ID.test(entry.id) && entry.title !== '[Private video]' && entry.title !== '[Deleted video]')
                 .map((entry) => new Song({ ...youtubeInfo(entry), plugin: this }, options));
@@ -188,7 +201,8 @@ class YouTubePlugin extends ExtractorPlugin {
         }
 
         // One call returns metadata *and* the stream URL, so playback can start right away.
-        const info = await this.run(watchUrl(parsed.id), ['--no-playlist', '-f', AUDIO_FORMAT], { proxy });
+        const info = await this.run(watchUrl(parsed.id), ['--no-playlist', '-f', AUDIO_FORMAT], { proxy, signal: signalOf(options) });
+        signalOf(options)?.throwIfAborted();
         const song = new Song({ ...youtubeInfo(info), plugin: this }, options);
         this.base.rememberInfo(guildId, song.url, info);
         return song;
@@ -203,16 +217,19 @@ class YouTubePlugin extends ExtractorPlugin {
         const guildId = guildIdOf(options);
         let info;
         try {
-            info = await this.searchInfo(query, guildId);
+            info = await this.searchInfo(query, guildId, { signal: signalOf(options) });
         } catch (error) {
+            if (signalOf(options)?.aborted) throw signalOf(options).reason;
             this.lastSearchError = error;
             this.lastSearchErrorAt = Date.now();
-            log.warn(`YouTube search failed for "${query}": ${error.message}`);
+            diagnostic('metadata_provider_error', { attemptId: options.metadata?.attemptId, source: 'youtube',
+                stage: 'metadata_lookup', outcome: 'failed', reason: classify(error) });
             const alternative = await this.#fallbackSearch(query, options);
             if (alternative) return alternative;
             throw error;
         }
-        if (!info) return null;
+        signalOf(options)?.throwIfAborted();
+        if (!info) return this.#fallbackSearch(query, options);
         const song = new Song({ ...youtubeInfo(info), plugin: this }, options);
         this.base.rememberInfo(guildId, song.url, info);
         return song;
@@ -221,21 +238,24 @@ class YouTubePlugin extends ExtractorPlugin {
     async #fallbackSearch(query, options) {
         if (!this.fallback) return null;
         try {
-            const song = await this.fallback.searchSong(query, options);
+            const song = await this.fallback.searchSong(query, { ...options,
+                metadata: { ...options.metadata, allowFallback: true } });
             if (!song) return null;
             song.fallbackFrom = 'youtube';
-            log.warn(`Playing "${query}" from SoundCloud instead of YouTube`);
+            log.warn('SoundCloud alternative resolved; audio has not started yet');
             return song;
         } catch (error) {
-            log.warn(`SoundCloud fallback found nothing for "${query}": ${error.message}`);
+            log.warn(`SoundCloud fallback unavailable: ${classify(error)}`);
             return null;
         }
     }
 
-    searchInfo(query, guildId, { priority = 'high' } = {}) {
+    searchInfo(query, guildId, { priority = 'high', signal } = {}) {
+        signal?.throwIfAborted();
         const proxy = ytdlp.proxyFor(guildId);
         return this.searches.wrap(`${proxy || 'direct'}|${query.toLowerCase()}`, async () => {
-            const result = await this.run(`ytsearch1:${query}`, ['-f', AUDIO_FORMAT], { proxy, priority });
+            const result = await this.run(`ytsearch1:${query}`, ['-f', AUDIO_FORMAT], { proxy, priority, signal });
+            signal?.throwIfAborted();
             const info = result?.entries ? result.entries.find(Boolean) : result;
             return info?.id ? info : null;
         });
@@ -254,6 +274,7 @@ class YouTubePlugin extends ExtractorPlugin {
      * the same song is played from SoundCloud when possible.
      */
     async getStreamURL(song) {
+        signalOf(song)?.throwIfAborted();
         // DisTube asks the plugin that answered the search; a SoundCloud fallback song plays through its own plugin.
         if (song.plugin && song.plugin !== this) return song.plugin.getStreamURL(song);
         try {
@@ -264,17 +285,25 @@ class YouTubePlugin extends ExtractorPlugin {
             this.streamFailures = 0;
             return url;
         } catch (error) {
+            if (signalOf(song)?.aborted) throw signalOf(song).reason;
+            // A cached search contains signed media too. Never reuse it after a failed stream.
+            this.searches.clear();
             if (!this.fallback) throw error;
             if (Date.now() >= this.skipYouTubeUntil && ++this.streamFailures >= BLOCKED_AFTER_FAILURES) {
                 this.streamFailures = 0;
                 this.skipYouTubeUntil = Date.now() + BLOCKED_PAUSE_MS;
-                log.warn(`YouTube refused ${BLOCKED_AFTER_FAILURES} streams in a row: using SoundCloud directly for ${BLOCKED_PAUSE_MS / 60_000} minutes. Fix: COOKIES_FILE (see README).`);
+                log.warn(`YouTube failed ${BLOCKED_AFTER_FAILURES} streams: temporarily using explicitly enabled alternatives`);
             }
-            log.warn(`YouTube stream failed for "${song.name}": ${error.message}`);
+            log.warn(`YouTube stream failed: ${classify(error)}`);
             const query = [song.name, song.uploader?.name].filter(Boolean).join(' ');
-            const alternative = await this.#fallbackSearch(query, { metadata: song.metadata, member: song.member });
+            const alternative = await this.#fallbackSearch(query, { metadata: { ...song.metadata,
+                signal: signalOf(song), fallbackExpected: { name: song.name, artist: song.uploader?.name, duration: song.duration } }, member: song.member });
             if (!alternative) throw error;
             const url = await this.fallback.getStreamURL(alternative);
+            signalOf(song)?.throwIfAborted();
+            // Queue, announcements, statistics and recommendations must describe actual audio.
+            for (const key of ['id', 'name', 'source', 'url', 'duration', 'formattedDuration', 'thumbnail', 'uploader', 'isLive']) song[key] = alternative[key];
+            song.plugin = this.fallback;
             song.fallbackFrom = 'youtube';
             return url;
         }
@@ -293,11 +322,12 @@ class YouTubePlugin extends ExtractorPlugin {
     }
 
     async getRelatedSongs(song) {
+        signalOf(song)?.throwIfAborted();
         if (!VIDEO_ID.test(song?.id || '')) return [];
         const guildId = guildIdOf(song);
         const result = await this.run(`${watchUrl(song.id)}&list=RD${song.id}`, [
             '--flat-playlist', '--playlist-end', '15',
-        ], { proxy: ytdlp.proxyFor(guildId), priority: 'low' });
+        ], { proxy: ytdlp.proxyFor(guildId), priority: 'low', signal: signalOf(song) });
         return (result?.entries || [])
             .filter((entry) => entry?.id && entry.id !== song.id && VIDEO_ID.test(entry.id))
             .filter((entry) => !entry.duration || (entry.duration >= 60 && entry.duration <= 900))

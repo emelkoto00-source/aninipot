@@ -86,10 +86,11 @@ function cleanError(stderr) {
  * Run yt-dlp and parse the JSON it prints. stdout and stderr are kept apart so warnings
  * never corrupt the JSON.
  */
-function runJson(target, extraArgs = [], { proxy = null, priority = 'high', timeoutMs = config.ytdlp.timeoutMs } = {}) {
+function runJson(target, extraArgs = [], { proxy = null, priority = 'high', timeoutMs = config.ytdlp.timeoutMs, signal } = {}) {
     const args = [...baseArgs({ proxy }), ...extraArgs, '--dump-single-json', '--', target];
 
     return limiter.run(() => new Promise((resolve, reject) => {
+        if (signal?.aborted) return reject(signal.reason);
         const started = Date.now();
         let stdout = '';
         let stderr = '';
@@ -100,6 +101,7 @@ function runJson(target, extraArgs = [], { proxy = null, priority = 'high', time
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            signal?.removeEventListener('abort', abort);
             if (error) reject(error);
             else resolve(value);
         };
@@ -109,14 +111,20 @@ function runJson(target, extraArgs = [], { proxy = null, priority = 'high', time
             finish(new YtDlpError(`yt-dlp timed out after ${Math.round(timeoutMs / 1000)}s`));
         }, timeoutMs);
 
-        child.stdout.setEncoding('utf8').on('data', (data) => (stdout += data));
-        child.stderr.setEncoding('utf8').on('data', (data) => (stderr += data));
+        const abort = () => { child.kill('SIGKILL'); finish(signal.reason); };
+        signal?.addEventListener('abort', abort, { once: true });
+
+        child.stdout.setEncoding('utf8').on('data', (data) => {
+            stdout += data;
+            if (stdout.length > 16 * 1024 * 1024) { child.kill('SIGKILL'); finish(new YtDlpError('Metadata response exceeded the size limit')); }
+        });
+        child.stderr.setEncoding('utf8').on('data', (data) => (stderr = (stderr + data).slice(-16_384)));
         child.on('error', (error) => {
             const hint = error.code === 'ENOENT' ? ' (yt-dlp binary not found, run "npm install" or set YTDLP_PATH)' : '';
             finish(new YtDlpError(`${error.message}${hint}`));
         });
         child.on('close', (code) => {
-            log.debug(`${code} in ${Date.now() - started}ms: ${target}`);
+            log.debug(`Metadata process exit=${code} elapsedMs=${Date.now() - started}`);
             if (code !== 0) return finish(new YtDlpError(cleanError(stderr), stderr));
             try {
                 finish(null, JSON.parse(stdout));

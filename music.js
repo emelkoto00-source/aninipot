@@ -1,30 +1,27 @@
 import { createRequire } from "node:module";
 import { EmbedBuilder, PermissionFlagsBits } from "discord.js";
 import { createListeningStats } from "./music_stats.js";
+import { MusicSessions } from "./music_session.js";
+import { configureSoundCloud } from "./music_sources.js";
+import { instrumentMusic } from "./music_runtime.js";
 
-// DisTube music manager. YouTube remains first choice; guarded SoundCloud is an
-// alternative only when full-length playback is plausible (no preview URLs).
-// The Beatra YouTube extractor, yt-dlp runner and audio relay remain unchanged.
+// Music commands retain the existing DisTube engine with cancellable per-guild requests.
 const require = createRequire(import.meta.url);
 
-export function createMusicManager(client) {
+export function createMusicManager(client, { engineFactory, statsFactory = createListeningStats } = {}) {
   let distube = null;
   let initialization = null;
   let startupError = null;
   const idleTimers = new Map();
   const stayConnected = new Set();
   const autoplayPreferences = new Map();
-  const stats = createListeningStats(client, () => distube);
+  const stats = statsFactory(client, () => distube);
+  const sessions = new MusicSessions();
+  const preparing = new Map();
+  let runtime;
+  let relay;
 
-  function redact(error) {
-    let msg = String(error?.message || error || "Unknown error");
-    for (const secret of [process.env.DISCORD_TOKEN, process.env.PROXY_URL,
-      process.env.COOKIES_FILE, process.env.YOUTUBE_PO_TOKEN]) {
-      if (secret) msg = msg.split(secret).join("[redacted]");
-    }
-    // yt-dlp may include signed CDN links; avoid exposing them in Discord messages.
-    return msg.replace(/https?:\/\/\S+/g, "[media URL]").slice(0, 650).replaceAll("`", "'");
-  }
+  const { redact, event: diagnostic, classify } = require("./beatra_engine/src/core/diagnostics.js");
 
   function cancelIdle(guildId) {
     if (idleTimers.has(guildId)) clearTimeout(idleTimers.get(guildId));
@@ -48,90 +45,49 @@ export function createMusicManager(client) {
     if (distube) return distube;
     if (initialization) return initialization;
     initialization = (async () => {
-      // Download/check both executables BEFORE requiring the yt-dlp runner. The runner
-      // resolves its binary path at module load time.
-      const { ensureYtDlp, ensureFfmpeg } = require("./beatra_engine/src/core/binaries.js");
-      console.log("[DisTube trial] Checking yt-dlp and FFmpeg (first boot may take longer)...");
-      const [ytDlpPath, ffmpegPath] = await Promise.all([ensureYtDlp(), ensureFfmpeg()]);
-      if (!ytDlpPath || !ffmpegPath) {
-        throw new Error("Missing yt-dlp or FFmpeg. See the Railway Deploy Logs for the download error.");
+      const { Events } = require("distube");
+      let instance;
+      if (engineFactory) {
+        ({ instance, relay } = await engineFactory());
+      } else {
+        const config = require("./beatra_engine/src/config.js");
+        const { ensureYtDlp, ensureFfmpeg, probe } = require("./beatra_engine/src/core/binaries.js");
+        const [ytDlpPath, ffmpegPath] = await Promise.all([ensureYtDlp(), ensureFfmpeg()]);
+        if (!ytDlpPath || !ffmpegPath) throw new Error("Missing yt-dlp or FFmpeg executable.");
+        // Match the checked executable to the path captured when the runner is loaded.
+        config.ytdlp.path = ytDlpPath;
+        const { DisTube } = require("distube");
+        const { YouTubePlugin, RelayedSoundCloudPlugin, relayStream } = require("./beatra_engine/src/music/plugins.js");
+        const { proxyFor } = require("./beatra_engine/src/music/ytdlp.js");
+        relay = require("./beatra_engine/src/music/relay.js").getRelay();
+        const soundcloud = configureSoundCloud(new RelayedSoundCloudPlugin(), { relayStream, proxyFor });
+        instance = new DisTube(client, {
+          plugins: [new YouTubePlugin({ fallback: config.youtubeFallback ? soundcloud : null }), soundcloud],
+          emitAddSongWhenCreatingQueue: false, emitAddListWhenCreatingQueue: false,
+          joinNewVoiceChannel: false,
+          ffmpeg: { path: ffmpegPath, args: { input: { reconnect: 0, reconnect_streamed: 0, reconnect_delay_max: null } } }
+        });
+        const [yt, ff] = await Promise.all([probe(ytDlpPath), probe(ffmpegPath, ['-version'])]);
+        diagnostic('runtime', { node: process.version, distube: require('distube').version, voice: require('@discordjs/voice').version,
+          ytDlp: yt.ok ? yt.output.split(/\r?\n/)[0] : 'unavailable',
+          ffmpeg: ff.ok ? ff.output.split(/\r?\n/)[0] : 'unavailable' });
       }
-      console.log("[DisTube] Executables ready. YouTube first, SoundCloud preview guard enabled.");
-      const { DisTube, Events } = require("distube");
-      const { YouTubePlugin, RelayedSoundCloudPlugin, relayStream } = require("./beatra_engine/src/music/plugins.js");
-      const { SoundCloudPlugin } = require("@distube/soundcloud");
-      const { proxyFor } = require("./beatra_engine/src/music/ytdlp.js");
-      // CRITICAL: Beatra's relay is required for SoundCloud too. The plain
-      // SoundCloudPlugin returned a remote HLS URL directly to FFmpeg; on some
-      // sources FFmpeg would finish immediately without delivering any audio.
-      // Keep the full-length preview filter before passing the URL to the relay.
-      const soundcloud = new RelayedSoundCloudPlugin();
-      const originalSearchSong = soundcloud.searchSong.bind(soundcloud);
-      soundcloud.searchSong = async (...args) => {
-        const candidate = await originalSearchSong(...args);
-        if (candidate && Number(candidate.duration) > 0 && Number(candidate.duration) < 60) {
-          console.warn("[DisTube] Rejected short SoundCloud search result:", candidate.name);
-          return null;
-        }
-        return candidate;
-      };
-      // Call the underlying SoundCloud API before the relay wrapper so preview
-      // URLs can be rejected, then stream actual bytes through yt-dlp's relay.
-      soundcloud.getStreamURL = async song => {
-        const result = await SoundCloudPlugin.prototype.getStreamURL.call(soundcloud, song);
-        const streamUrl = typeof result === 'string' ? result : (result?.url || '');
-        if (typeof streamUrl !== 'string' || !/^https?:\/\//i.test(streamUrl)) {
-          throw new Error('SoundCloud did not provide a supported media URL.');
-        }
-        if (/(?:\/|%2f)preview(?:\/|%2f|\?|$)/i.test(streamUrl) || /(?:[?&]type=preview)/i.test(streamUrl)) {
-          console.warn('[DisTube] Rejected preview-only SoundCloud stream:', song?.name || 'unknown');
-          throw new Error('SoundCloud provided a preview clip, not the full track.');
-        }
-        const guildId = song?.metadata?.guildId || song?.member?.guild?.id || null;
-        // relayStream waits for media bytes. If the download fails or only
-        // returns HTTP 403, /play fails instead of reporting a silent start.
-        const relayUrl = await relayStream(soundcloud.relay, { url: streamUrl, proxy: proxyFor(guildId) });
-        console.log(`[DisTube] SoundCloud audio relay ready: ${String(song?.name || 'track').slice(0, 120)}`);
-        return relayUrl;
-      };
-      const instance = new DisTube(client, {
-        plugins: [new YouTubePlugin({ fallback: soundcloud }), soundcloud],
-        emitAddSongWhenCreatingQueue: false,
-        emitAddListWhenCreatingQueue: false,
-        joinNewVoiceChannel: false,
-        ffmpeg: {
-          path: ffmpegPath,
-          args: { input: { reconnect: 0, reconnect_streamed: 0, reconnect_delay_max: null } }
-        }
-      });
+      runtime = instrumentMusic(instance, { sessions, relay, notice: (guildId, content) => {
+        const channel = instance.getQueue(guildId)?.textChannel;
+        if (channel) void channel.send({ content, allowedMentions: { parse: [] } }).catch(() => {});
+      } });
       instance.on(Events.PLAY_SONG, (queue, song) => {
         cancelIdle(queue.id);
         if (autoplayPreferences.has(queue.id) && Boolean(queue.autoplay) !== autoplayPreferences.get(queue.id)) {
           try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
         }
-        console.log(`[DisTube trial] Playing in ${queue.id}: ${song.name} (${song.duration}s) [${song.source}]`);
+
       });
-      instance.on(Events.ADD_SONG, (queue, song) => {
-        console.log(`[DisTube trial] Queued in ${queue.id}: ${song.name}`);
-      });
-      instance.on(Events.FINISH, queue => {
-        console.log(`[DisTube trial] Queue finished in ${queue.id}`);
-        scheduleIdle(queue.id);
-      });
-      instance.on(Events.DISCONNECT, queue => {
-        cancelIdle(queue.id);
-        console.warn(`[DisTube trial] Disconnected in ${queue.id}`);
-      });
-      instance.on(Events.DELETE_QUEUE, queue => {
-        console.log(`[DisTube trial] Queue deleted in ${queue.id}`);
-        scheduleIdle(queue.id);
-      });
-      instance.on(Events.ERROR, (error, queue, song) => {
-        console.error(`[DisTube trial] Audio failed in ${queue?.id || "unknown"} (${song?.name || "unknown"}): ${redact(error)}`);
-      });
-      if (String(process.env.DEBUG || "").toLowerCase() === "true") {
-        instance.on(Events.DEBUG, msg => console.log("[DisTube debug]", msg));
-      }
+      instance.on(Events.FINISH, queue => scheduleIdle(queue.id));
+      instance.on(Events.DISCONNECT, queue => { cancelIdle(queue.id); sessions.cancel(queue.id); sessions.release(queue.id); });
+      instance.on(Events.DELETE_QUEUE, queue => { scheduleIdle(queue.id); sessions.release(queue.id); });
+      instance.on(Events.NO_RELATED, queue => diagnostic('playback', { stage: 'recommendations', outcome: 'unavailable' }));
+      // Never subscribe raw DEBUG/FFMPEG_DEBUG messages: they contain source URLs/arguments.
       distube = instance;
       startupError = null;
       console.log("[DisTube trial] Ready. Lavalink is not used by this build.");
@@ -152,80 +108,104 @@ export function createMusicManager(client) {
 
   async function play(interaction) {
     if (!interaction.inGuild()) return interaction.reply({ content: "Use `/play` in your Discord server.", ephemeral: true });
-    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-    const voice = member?.voice?.channel;
-    if (!voice) return interaction.reply({ content: "🎧 Join a voice channel first.", ephemeral: true });
-    const me = interaction.guild.members.me || await interaction.guild.members.fetchMe().catch(() => null);
-    const perms = me && voice.permissionsFor(me);
-    if (!perms?.has(PermissionFlagsBits.Connect) || !perms?.has(PermissionFlagsBits.Speak)) {
-      return interaction.reply({ content: "bebot needs **Connect** and **Speak** permissions in your voice channel.", ephemeral: true });
-    }
-    const query = interaction.options.getString("query", true).trim();
-    if (!query) return interaction.reply({ content: "Please provide a YouTube/SoundCloud URL or a song title.", ephemeral: true });
-    if (/^https?:\/\//i.test(query)) {
-      let hostname = "";
-      try { hostname = new URL(query).hostname.toLowerCase(); } catch { /* invalid URL */ }
-      if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be", "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com"].includes(hostname)) {
-        return interaction.reply({ content: "Use a **YouTube or SoundCloud track URL**, or search by song title. Spotify links are not enabled.", ephemeral: true });
-      }
-    }
-    await interaction.deferReply();
+    if ((preparing.get(interaction.guildId)?.size || 0) >= 10) return interaction.reply({ content: 'Too many music requests are waiting. Please try again shortly.', ephemeral: true });
+    const signal = sessions.state(interaction.guildId).controller.signal;
+    const request = { userId: interaction.user.id, voiceId: interaction.member?.voice?.channelId };
+    if (!preparing.has(interaction.guildId)) preparing.set(interaction.guildId, new Set());
+    preparing.get(interaction.guildId).add(request);
     try {
-      const player = await init();
-      const current = player.getQueue(interaction.guildId);
-      if (current && current.voiceChannel?.id !== voice.id) {
-        throw new Error("Music is already active in another voice channel. Use `/stop` there first.");
+      await interaction.deferReply();
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const voice = member?.voice?.channel;
+      request.voiceId = voice?.id;
+      signal.throwIfAborted();
+      if (!voice) return interaction.editReply({ content: "🎧 Join a voice channel first.", ephemeral: true });
+      const me = interaction.guild.members.me || await interaction.guild.members.fetchMe().catch(() => null);
+      const perms = me && voice.permissionsFor(me);
+      if (!perms?.has(PermissionFlagsBits.Connect) || !perms?.has(PermissionFlagsBits.Speak)) {
+        return interaction.editReply({ content: "bebot needs **Connect** and **Speak** permissions in your voice channel.", ephemeral: true });
       }
-      cancelIdle(interaction.guildId);
-      console.log(`[DisTube trial] /play requested for guild ${interaction.guildId}: ${query.slice(0, 120)}`);
-      await player.play(voice, query, {
-        member,
-        textChannel: interaction.channel,
-        metadata: { guildId: interaction.guildId, requesterId: interaction.user.id }
+      const query = interaction.options.getString("query", true).trim();
+      if (!query) return interaction.editReply({ content: "Please provide a YouTube/SoundCloud URL or a song title.", ephemeral: true });
+      if (/^https?:\/\//i.test(query)) {
+        let hostname = "";
+        try { hostname = new URL(query).hostname.toLowerCase(); } catch { /* invalid URL */ }
+        if (!["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtu.be", "soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "on.soundcloud.com"].includes(hostname)) {
+          return interaction.editReply({ content: "Use a **YouTube or SoundCloud track URL**, or search by song title. Spotify links are not enabled.", ephemeral: true });
+        }
+      }
+      sessions.reserve(interaction.guildId, voice.id);
+      const resolved = await sessions.run(interaction.guildId, async () => {
+        signal.throwIfAborted();
+        const player = await init();
+        signal.throwIfAborted();
+        const current = player.getQueue(interaction.guildId);
+        if (current && current.voiceChannel?.id !== voice.id) throw new Error("Music is already active in another voice channel.");
+        cancelIdle(interaction.guildId);
+        const options = { member, textChannel: interaction.channel,
+          metadata: { guildId: interaction.guildId, requesterId: interaction.user.id, signal } };
+        const result = await runtime.resolve(query, options);
+        signal.throwIfAborted();
+        if ((current?.songs.length || 0) + (result.songs?.length || 1) > 500) throw new Error('The music queue is full.');
+        // Metadata is already attached. Passing it again would overwrite per-track attempt IDs.
+        try { await player.play(voice, result, { member, textChannel: interaction.channel }); }
+        finally { runtime.requestDone(result); }
+        signal.throwIfAborted();
+        const failure = runtime.errors.get(result.songs?.[0] || result);
+        if (failure) throw failure; // DisTube can emit ERROR yet resolve play().
+        return result;
       });
-      const q = player.getQueue(interaction.guildId);
-      if (q && autoplayPreferences.has(interaction.guildId) && Boolean(q.autoplay) !== autoplayPreferences.get(interaction.guildId)) {
-        q.toggleAutoplay();
-      }
-      const song = q?.songs?.at(-1);
+      const song = resolved.songs?.[0] || resolved;
       const embed = new EmbedBuilder()
         .setColor(0xED91CF)
         .setTitle("🎵 Music Requested")
         .setDescription(song?.url ? `[${song.name}](${song.url})` : (song?.name || "Music request submitted"));
-      await interaction.editReply({ embeds: [embed] });
+      await interaction.editReply({ embeds: [embed], allowedMentions: { parse: [] } });
     } catch (error) {
-      console.error("[DisTube trial] /play error:", redact(error));
-      await interaction.editReply(`❌ Unable to play this song: ${redact(error)}\nYouTube may be blocking this server, and no verified full-length alternative was available.`);
+      diagnostic('request', { stage: 'command', outcome: 'failed', reason: classify(error) });
+      await interaction.editReply({ content: sessions.state(interaction.guildId).controller.signal.aborted || error.name === 'AbortError'
+        ? '⏹️ Music request cancelled.' : '❌ This music request could not be completed. Details are in the bot logs.', allowedMentions: { parse: [] } });
+    } finally {
+      preparing.get(interaction.guildId)?.delete(request);
+      if (!preparing.get(interaction.guildId)?.size) preparing.delete(interaction.guildId);
+      if (!distube?.getQueue(interaction.guildId) && !distube?.voices.get(interaction.guildId)) sessions.release(interaction.guildId);
     }
   }
 
   async function stop(interaction) {
-    if (!interaction.inGuild()) return interaction.reply({ content: "Use `/stop` inside your server.", ephemeral: true });
+    if (!interaction.inGuild()) return interaction.reply({ content: "Use this command inside your server.", ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
+    const id = interaction.guildId;
+    const queue = distube?.getQueue(id);
+    const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+    const requests = [...(preparing.get(id) || [])];
+    const channelId = queue?.voiceChannel?.id || distube?.voices.get(id)?.channelId || sessions.states.get(id)?.voiceId || requests.find(r => r.voiceId)?.voiceId;
+    const ownsUnresolved = !channelId && requests.length && requests.every(r => r.userId === interaction.user.id);
+    if (!channelId && !requests.length) return interaction.editReply('No music session is active.');
+    if (!ownsUnresolved && (!channelId || member?.voice?.channelId !== channelId) && !interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.editReply("Join the bot's voice channel or have **Manage Server** permission.");
+    }
+    sessions.cancel(id); // invalidate in-flight and queued requests BEFORE waiting for the lock
+    if (queue) runtime?.cancelTrack(queue);
+    cancelIdle(id); stayConnected.delete(id); autoplayPreferences.delete(id);
     try {
-      const player = distube;
-      if (!player) return interaction.editReply(startupError ? `Audio engine unavailable: ${startupError}` : "No music session is active.");
-      const queue = player.getQueue(interaction.guildId);
-      const voiceSession = player.voices.get(interaction.guildId);
-      if (!queue && !voiceSession) return interaction.editReply("No music session is active.");
-      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      const allowed = member?.voice?.channelId === (queue?.voiceChannel?.id || voiceSession?.channelId) ||
-        interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
-      if (!allowed) return interaction.editReply("Join the bot's voice channel or have **Manage Server** permission.");
-      cancelIdle(interaction.guildId);
-      stayConnected.delete(interaction.guildId);
-      autoplayPreferences.delete(interaction.guildId);
-      if (queue) await queue.stop();
-      player.voices.leave(interaction.guildId);
-      return interaction.editReply("⏹️ Stopped music and disconnected.");
+      await sessions.run(id, async () => {
+        const current = distube?.getQueue(id);
+        if (current) await current.stop();
+        distube?.voices.get(id)?.stream?.kill();
+        if (distube?.voices.get(id)) distube.voices.leave(id);
+      });
+      cancelIdle(id); sessions.release(id);
+      return interaction.editReply('⏹️ Stopped music and disconnected.');
     } catch (error) {
-      console.error("[DisTube trial] /stop error:", redact(error));
-      return interaction.editReply(`❌ Could not stop playback: ${redact(error)}`);
+      diagnostic('request', { stage: 'stop', outcome: 'failed', reason: classify(error) });
+      return interaction.editReply('❌ Could not finish disconnecting. Details are in the bot logs.');
     }
   }
 
   // Playback controls are isolated from the working yt-dlp extractor and relay.
   async function control(interaction) {
+    if (['stop', 'leave'].includes(interaction.commandName)) return stop(interaction);
     if (!interaction.inGuild()) return interaction.reply({ content: 'Use music commands in the Discord server.', ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     const command = interaction.commandName;
@@ -287,13 +267,29 @@ export function createMusicManager(client) {
       if (!player || (!queue && !['leave','stop'].includes(command))) return reply('No active song. Use `/play` first.');
       if (!channelId && command !== 'leave') return reply('No voice session is active.');
       if (command === 'skip' || command === 'next') {
-        if (queue.songs.length <= 1 && !queue.autoplay) {
-          await queue.stop();
-          scheduleIdle(interaction.guildId);
-          return reply('⏭️ Skipped the final track. Queue is now empty.');
-        }
-        await queue.skip();
-        return reply('⏭️ Skipped to the next track.');
+        if (runtime?.pending.has(interaction.guildId)) return reply('The track is still loading. Use `/stop` to cancel it, or try `/skip` after playback starts.');
+        const message = await sessions.run(interaction.guildId, async () => {
+          const current = player.getQueue(interaction.guildId);
+          if (!current || current !== queue) return 'The music session changed. Please try again.';
+          // No Idle transition exists yet while extraction is pending. Do not mutate its head.
+          if (runtime?.pending.has(interaction.guildId) || !current.voice?.stream || current.voice.audioPlayer?.state.status === 'idle') {
+            return 'The track is still loading. Use `/stop` to cancel it, or try `/skip` after playback starts.';
+          }
+          const previous = current.songs[0];
+          const undoCancellation = runtime?.markCancelled(previous);
+          try {
+            if (current.songs.length <= 1 && !current.autoplay) {
+              await current.stop();
+              runtime?.cancelSong(previous);
+              scheduleIdle(interaction.guildId);
+              return '⏭️ Skipped the final track. Queue is now empty.';
+            }
+            await current.skip();
+            runtime?.cancelSong(previous);
+            return '⏭️ Skipped to the next track.';
+          } catch (error) { undoCancellation?.(); throw error; }
+        });
+        return reply(message);
       }
       if (command === 'pause') {
         if (queue.paused) return reply('Already paused.');
@@ -307,20 +303,26 @@ export function createMusicManager(client) {
         const value = interaction.options.getInteger('level', true);
         queue.setVolume(value); return reply(`🔊 Volume set to **${value}%**.`);
       }
-      if (command === 'leave') {
-        stayConnected.delete(interaction.guildId);
-        autoplayPreferences.delete(interaction.guildId);
-        cancelIdle(interaction.guildId);
-        if (queue) await queue.stop();
-        if (voiceSession) player.voices.leave(interaction.guildId);
-        return reply('👋 Left the voice channel.');
-      }
       return reply('Unknown music command.');
     } catch (error) {
       console.error(`[DisTube controls] ${command}:`, redact(error));
-      return reply(`❌ ${command} failed: ${redact(error)}`);
+      return reply(`❌ ${command} failed. Details are in the bot logs.`);
     }
   }
 
-  return { init, logStatus, play, stop, control, stats };
+  async function close() {
+    const draining = sessions.close();
+    relay?.close();
+    await draining;
+    for (const queue of [...(distube?.queues?.collection?.values?.() || [])]) await queue.stop();
+    for (const id of sessions.states.keys()) {
+      distube?.voices.get(id)?.stream?.kill();
+      if (distube?.voices.get(id)) distube.voices.leave(id);
+    }
+    relay?.close();
+    for (const id of idleTimers.keys()) cancelIdle(id);
+    runtime?.close();
+    await stats.flush?.();
+  }
+  return { init, logStatus, play, stop, control, stats, close };
 }

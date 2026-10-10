@@ -1,0 +1,9 @@
+{
+  "index.js": "0dc02f48a4eebc1c938ca341be696c8ac2d5d7fb85d2f94c0d3d1f08f39f91d7",
+  "commands.js": "9958fcdbd2322934369acd8fd978b2372444de2bd4af6cece64da32561b114ad",
+  "register-commands.js": "8f06589ee6b3c13d36d2061eff74aab4ae4edfa4b8d5ca8977073bc75f444143",
+  "music_stats.js": "9d0639c8c62bb1a239f4f23633d77eb22d5c4bf53ee87a7a763f41912605d8c6",
+  "music_profile.js": "1686147a90370949d6a0b40461b8d87580f14809b1717da606ff1cec40ce5471",
+  "profile_background.png": "26562813c7136cf6c40fbc7a3fa9bfe48d858cad51c7bdd6d7b330480d2d17e1",
+  "package.json": "a09aa8122654e607756fdcd527a001e905a3ca899fb33c13e219dddc7870d41a"
+}

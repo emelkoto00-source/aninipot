@@ -1,6 +1,7 @@
 'use strict';
 
 const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+const { redact } = require('./diagnostics');
 const paint = (code) => (text) => (useColor ? `\x1b[${code}m${text}\x1b[0m` : text);
 
 const colors = {
@@ -25,7 +26,7 @@ function write(level, scope, args) {
         .filter(Boolean)
         .join(' ');
     const out = level === 'error' || level === 'warn' ? console.error : console.log;
-    out(prefix, ...args);
+    out(prefix, ...args.map(redact));
 }
 
 function createLogger(scope) {
