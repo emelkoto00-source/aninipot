@@ -20,8 +20,10 @@ const require = createRequire(import.meta.url);
 const dt = require('distube');
 const { StreamRelay } = require('../beatra_engine/src/music/relay.js');
 const plugins = require('../beatra_engine/src/music/plugins.js');
+const { RecentTracks, titleKey } = require('../beatra_engine/src/music/recommendations.js');
 const diag = require('../beatra_engine/src/core/diagnostics.js');
 const { createMusicManager } = await import('../music.js');
+const { buildNowPlayingEmbed, buildRequestEmbed, announceNowPlaying } = await import('../music_embeds.js');
 const { MusicSessions } = await import('../music_session.js');
 const { instrumentMusic } = await import('../music_runtime.js');
 const { matchesAlternative, configureSoundCloud, bounded } = await import('../music_sources.js');
@@ -34,6 +36,12 @@ const waitFor = async check => { for (let i=0;i<100;i++) { if(check()) return; a
 const gid = '123456789012345678', vid = '123456789012345679';
 const song = (name = 'Example Artist Example Song', id = 'abcdefghijk') => new dt.Song({ id, name, source: 'youtube',
   url: `https://www.youtube.com/watch?v=${id}`, duration: 240, playFromSource: true, uploader: { name: 'Example Artist' } });
+const recommendationRunner = (entries, onMix = () => {}) => async target => {
+  if (target.includes('&list=')) { onMix(target); return {entries}; }
+  const entry=entries.find(e=>e.id===new URL(target).searchParams.get('v'));
+  if(!entry)throw Error('Unexpected extraction');
+  return {...entry,url:'https://example.invalid/audio',format_id:'251'};
+};
 
 function fakeSpawn(mode) {
   let child;
@@ -111,7 +119,7 @@ test('relay','actual FFmpeg decodes complete and interrupted synthetic WAV strea
   }
 });
 
-function harness({resolve,attach,join}={}) {
+function harness({resolve,attach,join,recommendations}={}) {
   const player=new EventEmitter();player.setMaxListeners(1);let creates=0,plays=0,left=0;
   player.options={ffmpeg:{path:'/usr/bin/ffmpeg',args:{}},savePreviousSongs:false};player.debug=()=>{};
   player.emitError=(e,q,s)=>player.emit('error',e,q,s);
@@ -132,7 +140,7 @@ function harness({resolve,attach,join}={}) {
   player.queues=new dt.QueueManager(player);player.getQueue=id=>player.queues.get(id);
   player.play=dt.DisTube.prototype.play.bind(player);
   const relay={errorFor:()=>null,discard(){},close(){}};
-  const manager=createMusicManager({},{engineFactory:async()=>({instance:player,relay}),statsFactory:()=>({flush(){}})});
+  const manager=createMusicManager({},{engineFactory:async()=>({instance:player,relay}),statsFactory:()=>({flush(){}}),recommendations});
   const interaction=(command='play',query='Example Artist Example Song',voiceId=vid)=>{
     const replies=[];const user={id:'123456789012345680'};const member={id:user.id,user,guild:channel.guild,voice:{channelId:voiceId,channel:{...channel,id:voiceId}}};
     return {commandName:command,guildId:gid,user,guild:{members:{me:{},fetch:async()=>member}},channel:{id:'123456789012345681',guildId:gid,type:0,nsfw:false,isThread:()=>false,send:async()=>{}},memberPermissions:{has:()=>false},inGuild:()=>true,
@@ -213,7 +221,7 @@ test('fallback','expired cache TTL is zero and failed relay invalidates extracti
   assert.equal(plugins.streamTtl('https://cdn.example.invalid/a?expire=1'),0);let extracts=0,discarded=0;
   const yt=new plugins.YouTubePlugin({runner:async()=>{extracts++;return {id:'abcdefghijk',url:'https://cdn.example.invalid/a',format_id:'251'};},relay:{register:async()=> 'relay',warm:async()=>{throw Error('403');},discard:()=>discarded++}});const s=song();s.plugin=yt;await assert.rejects(yt.getStreamURL(s));await assert.rejects(yt.getStreamURL(s));assert.equal(extracts,2);assert.equal(discarded,2);
 });
-test('fallback','autoplay still requests recommendations related to the seed',async()=>{let target;const yt=new plugins.YouTubePlugin({runner:async t=>{target=t;return {entries:[{id:'abcdefghijk',duration:240},{id:'bbbbbbbbbbb',duration:200},{id:'ccccccccccc',duration:30}]};},relay:{}});const list=await yt.getRelatedSongs(song());assert.match(target,/list=RDabcdefghijk/);assert.deepEqual(list.map(s=>s.id),['bbbbbbbbbbb']);});
+test('fallback','autoplay still requests recommendations related to the seed',async()=>{let target;const yt=new plugins.YouTubePlugin({runner:recommendationRunner([{id:'abcdefghijk',duration:240},{id:'bbbbbbbbbbb',duration:200},{id:'ccccccccccc',duration:30}],t=>target=t),relay:{}});const list=await yt.getRelatedSongs(song());assert.match(target,/list=RDabcdefghijk/);assert.deepEqual(list.map(s=>s.id),['bbbbbbbbbbb']);});
 
 test('diagnostics','redaction removes secrets, proxies and signed URLs; object dumps are dropped',()=>{
   process.env.TEST_SECRET='secret-fixture-only';const raw='secret-fixture-only https://cdn.example.invalid/a?sig=private socks5://u:p@proxy.invalid';const clean=diag.redact(raw);assert.ok(!clean.includes('secret-fixture-only'));assert.ok(!clean.includes('sig='));assert.ok(!clean.includes('u:p'));
@@ -301,7 +309,7 @@ for(const kind of ['throw','reject'])test('followup',`notification ${kind} canno
   const h=harness({attach:async s=>{if(s.name==='Bad song')throw Error('HTTP 403');}});
   try{
     await h.manager.play(h.interaction('play','First song'));
-    const q=h.player.getQueue(gid);let called=0;q.textChannel.send=()=>{called++;if(kind==='throw')throw Error('Discord unavailable');return Promise.reject(Error('Discord unavailable'));};
+    const q=h.player.getQueue(gid);let called=0;q.textChannel.send=payload=>{if(payload.content)called++;if(kind==='throw')throw Error('Discord unavailable');return Promise.reject(Error('Discord unavailable'));};
     await h.manager.play(h.interaction('play','Bad song'));await h.manager.play(h.interaction('play','Last song'));
     h.voice.stop();await waitFor(()=>h.counts().plays===2);await delay(0);
     assert.equal(q.songs[0].name,'Last song');assert.equal(called,1);
@@ -342,7 +350,7 @@ test('followup','cancelled context remains cancelled after DisTube clears metada
 
 
 test('followup','actual autoplay transition retains server and signal with a fresh attempt ID',async()=>{
-  let seed;const plugin=new plugins.YouTubePlugin({runner:async target=>{seed=target;return {entries:[{id:'bbbbbbbbbbb',title:'Related song',duration:200}]};},relay:{}});
+  let seed;const plugin=new plugins.YouTubePlugin({runner:recommendationRunner([{id:'bbbbbbbbbbb',title:'Related song',duration:200}],target=>seed=target),relay:{}});
   const h=harness();h.player.handler._getPluginFromSong=async()=>plugin;
   try{
     await h.manager.play(h.interaction());const q=h.player.getQueue(gid),first={...q.songs[0].metadata};q.toggleAutoplay();
@@ -354,6 +362,199 @@ test('followup','actual autoplay transition retains server and signal with a fre
 test('followup','unavailable autoplay recommendation removes queue without undefined server error',async()=>{
   const h=harness();h.player.handler._getPluginFromSong=async()=>({getRelatedSongs:async()=>[]});
   try{await h.manager.play(h.interaction());const q=h.player.getQueue(gid);q.toggleAutoplay();h.voice.stop();await waitFor(()=>!h.player.getQueue(gid));assert.equal(h.counts().plays,1);assert.equal(h.voice.audioPlayer.listenerCount('stateChange'),0);}finally{await h.manager.close();}
+});
+
+test('announcements','first track, natural completion and skip announce once each; enqueue and pause/resume do not',async()=>{
+  const h=harness(),sent=[];
+  try {
+    const first=h.interaction('play','First song');first.channel.send=async p=>sent.push(p);
+    await h.manager.play(first);assert.equal(sent.length,1);
+    await h.manager.play(h.interaction('play','Second song'));
+    await h.manager.play(h.interaction('play','Third song'));assert.equal(sent.length,1);
+    await h.manager.control(h.interaction('pause'));await h.manager.control(h.interaction('resume'));assert.equal(sent.length,1);
+    h.voice.stop();await waitFor(()=>sent.length===2);
+    await h.manager.control(h.interaction('skip'));await waitFor(()=>sent.length===3);
+    assert.deepEqual(sent.map(p=>p.embeds[0].data.description.match(/\[(.*?)\]/)[1]),['First song','Second song','Third song']);
+    for(const p of sent)assert.deepEqual(p.allowedMentions.parse,[]);
+    assert.equal(h.player.listenerCount('playSong'),1);
+    await h.manager.stop(h.interaction('stop'));assert.equal(sent.length,3);
+  } finally {await h.manager.close();}
+});
+test('announcements','playlist and repeated track announce at each new start',async()=>{
+  const h=harness({resolve:()=>new dt.Playlist({source:'youtube',name:'Fixture',songs:[song('First'),song('Second','bbbbbbbbbbb')]})}),sent=[];
+  try {
+    const i=h.interaction();i.channel.send=async p=>sent.push(p);await h.manager.play(i);assert.equal(sent.length,1);
+    assert.equal(sent[0].embeds[0].data.fields,undefined);
+    h.voice.stop();await waitFor(()=>sent.length===2);
+    h.player.getQueue(gid).setRepeatMode(1);h.voice.stop();await waitFor(()=>sent.length===3);
+    assert.equal(sent[1].embeds[0].data.description,sent[2].embeds[0].data.description);
+  } finally {await h.manager.close();}
+});
+test('announcements','autoplay successor announces without another request',async()=>{
+  const h=harness(),sent=[];
+  const plugin=new plugins.YouTubePlugin({runner:recommendationRunner([{id:'bbbbbbbbbbb',title:'Related song',duration:200}]),relay:{}});
+  h.player.handler._getPluginFromSong=async()=>plugin;
+  try {
+    const i=h.interaction();i.channel.send=async p=>sent.push(p);await h.manager.play(i);
+    h.player.getQueue(gid).toggleAutoplay();h.voice.stop();await waitFor(()=>sent.length===2);
+    assert.match(sent[1].embeds[0].data.description,/Related song/);
+  } finally {await h.manager.close();}
+});
+for(const kind of ['throw','reject','pending'])test('announcements',`Discord send ${kind} never blocks playback or queue advancement`,async()=>{
+  const h=harness();let sends=0;
+  try {
+    const i=h.interaction('play','First');i.channel.send=()=>{sends++;if(kind==='throw')throw Error('Missing permissions');if(kind==='reject')return Promise.reject(Error('Network error'));return new Promise(()=>{});};
+    await h.manager.play(i);assert.equal(h.counts().plays,1);assert.equal(sends,1);
+    await h.manager.play(h.interaction('play','Second'));h.voice.stop();await waitFor(()=>h.counts().plays===2);await delay(0);
+    assert.equal(sends,2);assert.equal(h.player.getQueue(gid).songs[0].name,'Second');
+  } finally {await h.manager.close();}
+});
+test('announcements','failed extraction never emits a Now Playing announcement',async()=>{
+  const h=harness({attach:async()=>{throw Error('403');}}),sent=[];
+  try {const i=h.interaction();i.channel.send=async p=>sent.push(p);await h.manager.play(i);assert.equal(sent.length,0);assert.equal(h.counts().plays,0);} finally {await h.manager.close();}
+});
+test('announcements','nowplaying uses the same design and pause state with a readable position',async()=>{
+  const h=harness();try {
+    await h.manager.play(h.interaction());h.voice.playbackTime=65;
+    await h.manager.control(h.interaction('pause'));
+    const i=h.interaction('nowplaying');await h.manager.control(i);
+    const e=i.replies.at(-1).embeds[0].toJSON();assert.match(e.title,/Paused/);
+    assert.match(e.description,/1:05 \/ 4:00/);
+    assert.equal(e.fields,undefined);assert.equal(e.author,undefined);assert.equal(e.footer,undefined);
+  } finally {await h.manager.close();}
+});
+test('announcements','embeds validate missing metadata, live streams, hostile long text and invalid URLs',async()=>{
+  for(const s of [{},{name:'[x] @everyone '.repeat(500),url:'javascript:alert(1)',thumbnail:'not a URL',duration:Infinity},
+    {name:'Live',isLive:true,url:'https://youtube.com/watch?v=abcdefghijk'},
+    {name:'Long URL',url:'https://example.com/'+ 'x'.repeat(1800),thumbnail:'https://example.com/cover.png'}]){
+    const q={songs:[s,s],voiceChannel:{id:vid}};
+    const json=buildNowPlayingEmbed(q,s).toJSON();buildRequestEmbed(s).toJSON();
+    assert.ok(json.description.length<=4096);assert.equal(json.fields,undefined);
+    assert.ok(!json.description.includes('javascript:'));if(s.isLive)assert.match(json.description,/LIVE/);
+  }
+  await announceNowPlaying({},{});
+  await announceNowPlaying({textChannel:{send(){throw Error('fail');}}},{},()=>{throw Error('logger failed');});
+});
+
+test('autoplay','recent IDs and alternate uploads with normalized titles are excluded',()=>{
+  const history=new RecentTracks();
+  const old=song('Sweet - Cigarettes After Sex (Official Music Video)','aaaaaaaaaaa');history.remember(gid,old);
+  const duplicate=song('Cigarettes After Sex / Sweet [Lyrics]','bbbbbbbbbbb');
+  const fresh=song('Another artist - New track','ccccccccccc');
+  const seed=song('Seed track','ddddddddddd');
+  assert.equal(titleKey(old),titleKey(duplicate));
+  assert.deepEqual(history.select(gid,[old,duplicate,seed,fresh],seed).map(s=>s.id),[fresh.id]);
+  assert.equal(history.select('another-server',[old],seed).length,1);
+});
+test('autoplay','queued tracks, prior queue IDs and duplicate candidates are excluded',()=>{
+  const history=new RecentTracks();const seed=song('Seed','aaaaaaaaaaa');
+  const queued=song('Queued track','bbbbbbbbbbb'),previous=song('Old track','ccccccccccc'),fresh=song('Fresh song','ddddddddddd');
+  const duplicate=song('Fresh song (Official Audio)','eeeeeeeeeee');
+  assert.deepEqual(history.select(gid,[queued,previous,fresh,fresh,duplicate],seed,{songs:[queued],previousSongs:[{id:previous.id}]}).map(s=>s.id),[fresh.id]);
+});
+test('autoplay','selection varies the recommendation order without changing its contents',()=>{
+  const history=new RecentTracks({random:()=>0});const seed=song('Seed','aaaaaaaaaaa');
+  const songs=[song('First fresh','bbbbbbbbbbb'),song('Second fresh','ccccccccccc'),song('Third fresh','ddddddddddd')];
+  const selected=history.select(gid,songs,seed);assert.equal(selected[0],songs[1]);assert.equal(songs[0].name,'First fresh');assert.equal(new Set(selected).size,3);
+});
+test('autoplay','history has bounded per-server memory and survives queue deletion',()=>{
+  const history=new RecentTracks({limit:2,maxGuilds:2});const a=song('Alpha','aaaaaaaaaaa'),b=song('Beta','bbbbbbbbbbb'),c=song('Gamma','ccccccccccc');
+  history.remember(gid,a);history.remember(gid,b);history.remember(gid,c);
+  assert.equal(history.guilds.get(gid).length,2);assert.equal(history.select(gid,[a],c).length,1);assert.equal(history.select(gid,[b],c).length,0);
+  history.remember('two',a);history.remember('three',b);assert.equal(history.guilds.size,2);
+});
+test('autoplay','YouTube requests a broader pool, preserves context and returns no repeated fallback',async()=>{
+  const history=new RecentTracks();let argsSeen,optionsSeen;
+  const seed=song('Seed','aaaaaaaaaaa');const ac=new AbortController();seed.metadata={guildId:gid,signal:ac.signal};history.remember(gid,song('Old track','bbbbbbbbbbb'));
+  const plugin=new plugins.YouTubePlugin({relay:{},recommendations:history,runner:async(target,args,options)=>{argsSeen=args;optionsSeen=options;return {entries:[{id:'bbbbbbbbbbb',title:'Old track',duration:200},{id:'ccccccccccc',title:'Old track (Lyrics)',duration:200}]};}});
+  assert.deepEqual(await plugin.getRelatedSongs(seed),[]);assert.deepEqual(argsSeen,['--flat-playlist','--playlist-end','40']);assert.equal(optionsSeen.signal,ac.signal);
+});
+test('autoplay','cancellation during recommendation lookup rejects before candidates reach the queue',async()=>{
+  const ac=new AbortController(),seed=song();seed.metadata={guildId:gid,signal:ac.signal};
+  const plugin=new plugins.YouTubePlugin({relay:{},runner:async()=>{ac.abort();return {entries:[{id:'bbbbbbbbbbb',title:'Fresh song',duration:200}]};}});
+  await assert.rejects(plugin.getRelatedSongs(seed),{name:'AbortError'});
+});
+test('autoplay','actual automatic transitions avoid duplicate uploads and end cleanly when all candidates were played',async()=>{
+  const recommendations=new RecentTracks(),h=harness({recommendations}),sent=[];
+  const entries=[{id:'aaaaaaaaaaa',title:'Sweet - Cigarettes After Sex (Official Music Video)',duration:200},{id:'bbbbbbbbbbb',title:'Sweet - Cigarettes After Sex (Lyrics)',duration:200},{id:'ccccccccccc',title:'A fresh different song',duration:200}];
+  const plugin=new plugins.YouTubePlugin({recommendations,relay:{},getQueue:()=>h.player.getQueue(gid),runner:recommendationRunner(entries)});
+  h.player.handler._getPluginFromSong=async()=>plugin;
+  try {
+    const i=h.interaction('play','Sweet - Cigarettes After Sex (Official Music Video)');i.channel.send=async p=>sent.push(p);await h.manager.play(i);
+    h.player.getQueue(gid).toggleAutoplay();h.voice.stop();await waitFor(()=>h.counts().plays===2);
+    assert.equal(h.player.getQueue(gid).songs[0].id,'ccccccccccc');assert.equal(sent.length,2);
+    h.voice.stop();await waitFor(()=>!h.player.getQueue(gid));assert.equal(h.counts().plays,2);
+    assert.match(sent.at(-1).content,/could not load a fresh recommendation/);
+    // A new queue retains the recent history but the user may deliberately replay.
+    await h.manager.play(h.interaction('play','Sweet - Cigarettes After Sex (Official Music Video)'));assert.equal(h.counts().plays,3);
+    const recent=recommendations.select(gid,[song('A fresh different song','ccccccccccc')],song('New seed','ddddddddddd'));
+    assert.equal(recent.length,0);
+  } finally {await h.manager.close();}
+});
+
+test('autoplay-check','challenged recommendation is skipped; next candidate audio metadata is reused',async()=>{
+  const entries=[{id:'bbbbbbbbbbb',title:'Blocked song',duration:200},{id:'ccccccccccc',title:'Playable song',duration:210}];
+  const calls=[],base=recommendationRunner(entries),recommendations=new RecentTracks({random:()=>.999});let relayed;
+  const p=new plugins.YouTubePlugin({recommendations,runner:async(target,args,options)=>{calls.push({target,options});if(target==='https://www.youtube.com/watch?v=bbbbbbbbbbb')throw Error("Sign in to confirm you're not a bot");return base(target);},
+    relay:{register:async value=>{relayed=value;return 'relay';},warm:async()=> 'relay'}});
+  const seed=song();seed.metadata={guildId:gid,signal:new AbortController().signal};
+  const [next]=await p.getRelatedSongs(seed);assert.equal(next.id,'ccccccccccc');assert.equal(calls.length,3);
+  assert.equal(await p.getStreamURL(next),'relay');assert.equal(calls.length,3);assert.equal(relayed.info.id,'ccccccccccc');
+  assert.equal(calls[1].options.timeoutMs,8000);assert.equal(calls[2].options.timeoutMs,8000);
+  await p.getRelatedSongs(seed);assert.equal(calls.filter(c=>c.target==='https://www.youtube.com/watch?v=bbbbbbbbbbb').length,1,'failed candidate cooldown');
+});
+test('autoplay-check','all challenged candidates are bounded to three exact IDs with no title search',async()=>{
+  let extracts=0;const ids=['bbbbbbbbbbb','ccccccccccc','ddddddddddd','eeeeeeeeeee'];
+  const p=new plugins.YouTubePlugin({relay:{},runner:async target=>{assert.ok(!target.startsWith('ytsearch'));if(target.includes('&list='))return {entries:ids.map((id,i)=>({id,title:'Different song '+i,duration:200}))};extracts++;throw Error("Sign in to confirm you're not a bot");}});
+  assert.deepEqual(await p.getRelatedSongs(song()),[]);assert.equal(extracts,3);
+});
+test('autoplay-check','stop during candidate validation cancels without selecting another candidate',async()=>{
+  const ac=new AbortController();let extracts=0;const seed=song();seed.metadata={guildId:gid,signal:ac.signal};
+  const p=new plugins.YouTubePlugin({relay:{},runner:async target=>{if(target.includes('&list='))return {entries:[{id:'bbbbbbbbbbb',title:'First candidate',duration:200},{id:'ccccccccccc',title:'Second candidate',duration:200}]};extracts++;ac.abort();throw ac.signal.reason;}});
+  await assert.rejects(p.getRelatedSongs(seed),{name:'AbortError'});assert.equal(extracts,1);assert.equal(p.rejectedRecommendations.entries.size,0);
+});
+test('autoplay-check','mismatched video identity and missing audio formats are rejected',async()=>{
+  for(const info of [{id:'ccccccccccc',url:'https://example.invalid/audio',format_id:'251'},{id:'bbbbbbbbbbb'}]){
+    const p=new plugins.YouTubePlugin({relay:{},runner:async target=>target.includes('&list=')?{entries:[{id:'bbbbbbbbbbb',title:'A candidate',duration:200}]}:info});
+    assert.deepEqual(await p.getRelatedSongs(song()),[]);
+  }
+});
+test('autoplay-check','real automatic handoff skips a challenged candidate without killing playback',async()=>{
+  const recommendations=new RecentTracks({random:()=>.999}),h=harness({recommendations}),sent=[];
+  const entries=[{id:'bbbbbbbbbbb',title:'Blocked candidate',duration:200},{id:'ccccccccccc',title:'Working candidate',duration:200}];
+  const base=recommendationRunner(entries);
+  const p=new plugins.YouTubePlugin({recommendations,getQueue:()=>h.player.getQueue(gid),relay:{},runner:async target=>{if(target==='https://www.youtube.com/watch?v=bbbbbbbbbbb')throw Error("Sign in to confirm you're not a bot");return base(target);}});
+  h.player.handler._getPluginFromSong=async()=>p;
+  try{const i=h.interaction();i.channel.send=async payload=>sent.push(payload);await h.manager.play(i);h.player.getQueue(gid).toggleAutoplay();h.voice.stop();await waitFor(()=>h.counts().plays===2);
+    assert.equal(h.player.getQueue(gid).songs[0].id,'ccccccccccc');assert.equal(sent.length,2);assert.match(sent[1].embeds[0].data.description,/Working candidate/);
+  }finally{await h.manager.close();}
+});
+test('autoplay-check','unavailable recommendation notice cannot interrupt queue cleanup',async()=>{
+  for(const kind of ['throw','reject']){const h=harness();h.player.handler._getPluginFromSong=async()=>({getRelatedSongs:async()=>[]});
+    try{await h.manager.play(h.interaction());const q=h.player.getQueue(gid);q.textChannel.send=()=>{if(kind==='throw')throw Error('Discord unavailable');return Promise.reject(Error('Discord unavailable'));};q.toggleAutoplay();h.voice.stop();await waitFor(()=>!h.player.getQueue(gid));await delay(0);assert.equal(h.counts().plays,1);}finally{await h.manager.close();}
+  }
+});
+test('exact-link','both reported link forms preserve the exact ID and never invoke title-search recovery',async()=>{
+  for(const suffix of ['', '&list=RD_m7MiuCqVxk&start_radio=1']){
+    const calls=[],error=Error("Sign in to confirm you're not a bot");
+    const p=new plugins.YouTubePlugin({relay:{},runner:async target=>{calls.push(target);throw error;}});
+    await assert.rejects(p.resolve('https://www.youtube.com/watch?v=_m7MiuCqVxk'+suffix),e=>e===error);
+    assert.deepEqual(calls,['https://www.youtube.com/watch?v=_m7MiuCqVxk']);assert.equal(p.recoverVideoLink,undefined);
+  }
+});
+
+test('exact-link','direct video stream refusal cannot substitute SoundCloud even when fallback is configured',async()=>{
+  let fallbackCalls=0,calls=0;
+  const p=new plugins.YouTubePlugin({relay:{},fallback:{searchSong:async()=>{fallbackCalls++;return song('Wrong upload');}},runner:async()=>{
+    calls++;if(calls===1)return {id:'_m7MiuCqVxk',title:'Requested exact upload',duration:276};throw Error("Sign in to confirm you're not a bot");
+  }});
+  const s=await p.resolve('https://youtu.be/_m7MiuCqVxk');assert.equal(s.exactVideoId,'_m7MiuCqVxk');
+  p.skipYouTubeUntil=Date.now()+60000;
+  await assert.rejects(p.getStreamURL(s),/Sign in/);assert.equal(calls,2);assert.equal(fallbackCalls,0);
+});
+test('exact-link','a different resolved video identity is never accepted for a pasted link',async()=>{
+  const p=new plugins.YouTubePlugin({relay:{},runner:async()=>({id:'c1gtzwJydhM',title:'Other upload',duration:276})});
+  await assert.rejects(p.resolve('https://youtu.be/_m7MiuCqVxk'),/identity/);
 });
 
 test('preservation','all 36 command definitions and handlers are unchanged',()=>{
