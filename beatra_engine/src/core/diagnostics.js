@@ -24,6 +24,7 @@ function redact(value) {
 }
 
 function classify(error) {
+    if (error?.code === 'MISSING_GUILD_CONTEXT') return 'MISSING_GUILD_CONTEXT';
     if (error?.name === 'AbortError' || error?.code === 'ABORT_ERR') return 'CANCELLED';
     const text = String(error?.message || error || '');
     if (/drm|protected/i.test(text)) return 'PROTECTED_SOURCE';
@@ -50,6 +51,11 @@ function event(name, fields = {}) {
         else if (typeof value === 'boolean') output[key] = value;
         else if (typeof value === 'string') output[key] = redact(value);
     }
+    // Railway displays `message`; other JSON fields remain searchable attributes.
+    // Build display text only from fields that already passed the allowlist/redactor.
+    output.level = output.outcome === 'failed' ? 'error' : 'info';
+    output.message = [output.event, output.stage, output.outcome, output.reason,
+        output.attemptId ? `attempt=${output.attemptId}` : undefined].filter(Boolean).join(' ');
     console.log(JSON.stringify(output));
 }
 

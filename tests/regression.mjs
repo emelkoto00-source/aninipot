@@ -112,11 +112,11 @@ test('relay','actual FFmpeg decodes complete and interrupted synthetic WAV strea
 });
 
 function harness({resolve,attach,join}={}) {
-  const player=new EventEmitter();let creates=0,plays=0,left=0;
+  const player=new EventEmitter();player.setMaxListeners(1);let creates=0,plays=0,left=0;
   player.options={ffmpeg:{path:'/usr/bin/ffmpeg',args:{}},savePreviousSongs:false};player.debug=()=>{};
   player.emitError=(e,q,s)=>player.emit('error',e,q,s);
-  const voice=new EventEmitter(); const channel={id:vid,guildId:gid,permissionsFor:()=>({has:()=>true})};
-  channel.guild={members:{me:{voice:{channel}}}};
+  const voice=new EventEmitter(); const channel={id:vid,guildId:gid,type:2,permissionsFor:()=>({has:()=>true})};
+  channel.guild={id:gid,members:{me:{voice:{channel}}}};
   Object.assign(voice,{id:gid,channelId:vid,channel,join:async()=>{if(join)await join();},audioPlayer:new EventEmitter(),connection:new EventEmitter(),playbackTime:0});
   voice.audioPlayer.state={status:'idle'};voice.connection.state={status:'ready'};
   voice.play=async stream=>{plays++;voice.stream=stream;voice.audioPlayer.state={status:'playing',resource:stream.audioResource};}; // no subprocess/network in command tests
@@ -124,14 +124,18 @@ function harness({resolve,attach,join}={}) {
   voice.pause=()=>{voice.audioPlayer.state.status='paused';};voice.unpause=()=>{voice.audioPlayer.state.status='playing';};
   let joined=false;
   player.voices={create:()=>{creates++;joined=true;return voice;},get:()=>joined?voice:undefined,leave:()=>{left++;joined=false;voice.stream?.kill();}};
-  player.handler={resolve:async(q,o)=>{const s=resolve?await resolve(q,o):song(q);s.metadata=o.metadata;return s;},attachStreamInfo:async s=>{if(attach)await attach(s);s.stream.url='http://127.0.0.1:9/unused';}};
+  const actualHandler=new dt.DisTubeHandler(player);
+  player.handler={resolve:async(q,o)=>{
+    if(q instanceof dt.Song || q instanceof dt.Playlist) return actualHandler.resolve(q,o);
+    const s=resolve?await resolve(q,o):song(q);s.metadata=o.metadata;return s;
+  },attachStreamInfo:async s=>{if(attach)await attach(s);s.stream.url='http://127.0.0.1:9/unused';}};
   player.queues=new dt.QueueManager(player);player.getQueue=id=>player.queues.get(id);
-  player.play=async(c,result)=>{const queue=player.getQueue(gid)||await player.queues.create(c,null);const first=!queue.songs.length;queue.addToQueue(result.songs||result);if(first)await queue.play();};
+  player.play=dt.DisTube.prototype.play.bind(player);
   const relay={errorFor:()=>null,discard(){},close(){}};
   const manager=createMusicManager({},{engineFactory:async()=>({instance:player,relay}),statsFactory:()=>({flush(){}})});
   const interaction=(command='play',query='Example Artist Example Song',voiceId=vid)=>{
-    const replies=[];const member={id:'user',voice:{channelId:voiceId,channel:{...channel,id:voiceId}}};
-    return {commandName:command,guildId:gid,user:{id:'user'},guild:{members:{me:{},fetch:async()=>member}},channel:{send:async()=>{}},memberPermissions:{has:()=>false},inGuild:()=>true,
+    const replies=[];const user={id:'123456789012345680'};const member={id:user.id,user,guild:channel.guild,voice:{channelId:voiceId,channel:{...channel,id:voiceId}}};
+    return {commandName:command,guildId:gid,user,guild:{members:{me:{},fetch:async()=>member}},channel:{id:'123456789012345681',guildId:gid,type:0,nsfw:false,isThread:()=>false,send:async()=>{}},memberPermissions:{has:()=>false},inGuild:()=>true,
       options:{getString:()=>query,getInteger:()=>1},replies,reply:async x=>replies.push(x),editReply:async x=>replies.push(x),deferReply:async()=>{}};
   };
   return {manager,player,voice,interaction,counts:()=>({creates,plays,left})};
@@ -268,12 +272,96 @@ test('diagnostics','provider bot-challenge category keeps its attempt ID through
   const e=lines.map(x=>{try{return JSON.parse(x);}catch{return {};}}).find(e=>e.event==='metadata_provider_error');assert.equal(e.attemptId,'lookup-fixture');assert.equal(e.reason,'SOURCE_CHALLENGE');
 });
 
+
+test('followup','DisTube second resolve preserves server, cancellation signal and attempt ID at retrieval',async()=>{
+  const player=new EventEmitter();player.handler={attachStreamInfo:async()=>{}};
+  const sessions=new MusicSessions(),rt=instrumentMusic(player,{sessions,relay:{errorFor:()=>null,discard(){}},report(){}});
+  try {
+    const s=song(),signal=sessions.reserve(gid,vid),r=rt.prepare(s,{guildId:gid,signal});
+    await new dt.DisTubeHandler(player).resolve(s,{metadata:undefined});
+    assert.equal(s.metadata,undefined,'real DisTube exhibits the original overwrite');
+    await player.handler.attachStreamInfo(s);
+    assert.equal(s.metadata.guildId,gid);assert.equal(s.metadata.signal,signal);assert.equal(s.metadata.attemptId,r.id);
+  }finally{rt.close();}
+});
+test('followup','missing track metadata uses error event queue context without throwing',()=>{
+  const player=new EventEmitter();player.handler={attachStreamInfo:async()=>{}};let discarded=0,notified;
+  const rt=instrumentMusic(player,{sessions:new MusicSessions(),relay:{errorFor:()=>null,discard(){discarded++;}},report(){},notice(id){assert.equal(id,gid);notified=id;}});
+  try{const s=song();rt.prepare(s);assert.doesNotThrow(()=>player.emit('error',Error('403'),{id:gid},s));assert.equal(notified,gid);assert.equal(discarded,1);assert.equal(rt.errors.get(s).message,'403');}finally{rt.close();}
+});
+test('followup','startup stays within DisTube listener limit without raising it',async()=>{
+  const h=harness();try{await h.manager.init();assert.equal(h.player.getMaxListeners(),1);for(const event of ['playSong','disconnect','deleteQueue'])assert.equal(h.player.listenerCount(event),1,event);}finally{await h.manager.close();}
+});
+test('followup','structured diagnostics include readable redacted message and severity',()=>{
+  const lines=[],log=console.log;
+  try{console.log=x=>lines.push(x);diag.event('playback',{stage:'stream_retrieval',outcome:'failed',reason:'HTTP_403',attemptId:'test-id',mediaUrl:'https://secret.invalid/?sig=private'});diag.event('runtime',{node:process.version});}finally{console.log=log;}
+  const [a,b]=lines.map(x=>JSON.parse(x));assert.equal(a.level,'error');assert.match(a.message,/stream_retrieval failed HTTP_403 attempt=test-id/);assert.equal(b.level,'info');assert.ok(b.message.length);assert.ok(!lines.join('').includes('secret.invalid'));
+});
+for(const kind of ['throw','reject'])test('followup',`notification ${kind} cannot abort actual DisTube recovery to successor`,async()=>{
+  const h=harness({attach:async s=>{if(s.name==='Bad song')throw Error('HTTP 403');}});
+  try{
+    await h.manager.play(h.interaction('play','First song'));
+    const q=h.player.getQueue(gid);let called=0;q.textChannel.send=()=>{called++;if(kind==='throw')throw Error('Discord unavailable');return Promise.reject(Error('Discord unavailable'));};
+    await h.manager.play(h.interaction('play','Bad song'));await h.manager.play(h.interaction('play','Last song'));
+    h.voice.stop();await waitFor(()=>h.counts().plays===2);await delay(0);
+    assert.equal(q.songs[0].name,'Last song');assert.equal(called,1);
+  }finally{await h.manager.close();}
+});
+test('followup','queued song with lost metadata recovers server from its exact queue',async()=>{
+  const h=harness();try{
+    await h.manager.play(h.interaction());const q=h.player.getQueue(gid),s=song('Unprepared next song');q.addToQueue(s);
+    h.voice.stop();await waitFor(()=>h.counts().plays===2);assert.equal(s.metadata.guildId,gid);assert.ok(s.metadata.signal);assert.ok(s.metadata.attemptId);
+  }finally{await h.manager.close();}
+});
+test('followup','reused track gets a new attempt ID while retaining original cancellation signal',async()=>{
+  const h=harness();try{
+    await h.manager.play(h.interaction());const q=h.player.getQueue(gid),s=q.songs[0],old={...s.metadata};q.setRepeatMode(1);
+    h.voice.stop();await waitFor(()=>h.counts().plays===2);assert.equal(s.metadata.guildId,gid);assert.notEqual(s.metadata.attemptId,old.attemptId);assert.equal(s.metadata.signal,old.signal);
+    await h.manager.stop(h.interaction('stop'));assert.equal(old.signal.aborted,true);
+  }finally{await h.manager.close();}
+});
+test('followup','actual playlist resolver keeps distinct per-track attempts and cancellation context',async()=>{
+  const h=harness({resolve:()=>new dt.Playlist({source:'youtube',name:'Fixture',songs:[song('First'),song('Second','bbbbbbbbbbb')]})});
+  try{
+    await h.manager.play(h.interaction());const q=h.player.getQueue(gid),first={...q.songs[0].metadata},second=q.songs[1];
+    h.voice.stop();await waitFor(()=>h.counts().plays===2);
+    assert.equal(second.metadata.guildId,gid);assert.equal(second.metadata.signal,first.signal);assert.notEqual(second.metadata.attemptId,first.attemptId);
+    await h.manager.stop(h.interaction('stop'));assert.equal(first.signal.aborted,true);
+  }finally{await h.manager.close();}
+});
+test('followup','missing all server context fails explicitly without undefined queue lookup or pending entry',async()=>{
+  const player=new EventEmitter();let lookups=0,discarded=0;player.getQueue=()=>{lookups++;throw Error('must not be called');};player.handler={attachStreamInfo:async()=>{throw Error('must not retrieve');}};
+  const sessions=new MusicSessions(),rt=instrumentMusic(player,{sessions,relay:{errorFor:()=>null,discard(){discarded++;}},report(){},notice(){throw Error('must not notify without server');}});
+  try{const s=song();await assert.rejects(player.handler.attachStreamInfo(s),{code:'MISSING_GUILD_CONTEXT'});assert.equal(lookups,0);assert.equal(rt.pending.size,0);assert.equal(sessions.states.has(undefined),false);assert.doesNotThrow(()=>player.emit('error',rt.errors.get(s),undefined,s));assert.equal(discarded,1);}finally{rt.close();}
+});
+test('followup','cancelled context remains cancelled after DisTube clears metadata',async()=>{
+  const player=new EventEmitter();let retrieved=0;player.handler={attachStreamInfo:async()=>{retrieved++;}};
+  const sessions=new MusicSessions(),rt=instrumentMusic(player,{sessions,relay:{errorFor:()=>null,discard(){}},report(){}});
+  try{const s=song();rt.prepare(s,{guildId:gid,signal:sessions.reserve(gid,vid)});await new dt.DisTubeHandler(player).resolve(s,{metadata:undefined});sessions.cancel(gid);await assert.rejects(player.handler.attachStreamInfo(s),{name:'AbortError'});assert.equal(retrieved,0);assert.equal(rt.pending.size,0);}finally{rt.close();}
+});
+
+
+test('followup','actual autoplay transition retains server and signal with a fresh attempt ID',async()=>{
+  let seed;const plugin=new plugins.YouTubePlugin({runner:async target=>{seed=target;return {entries:[{id:'bbbbbbbbbbb',title:'Related song',duration:200}]};},relay:{}});
+  const h=harness();h.player.handler._getPluginFromSong=async()=>plugin;
+  try{
+    await h.manager.play(h.interaction());const q=h.player.getQueue(gid),first={...q.songs[0].metadata};q.toggleAutoplay();
+    h.voice.stop();await waitFor(()=>h.counts().plays===2);const next=q.songs[0];
+    assert.match(seed,/list=RDabcdefghijk/);assert.equal(next.id,'bbbbbbbbbbb');assert.equal(next.metadata.guildId,gid);assert.equal(next.metadata.signal,first.signal);assert.notEqual(next.metadata.attemptId,first.attemptId);
+    await h.manager.stop(h.interaction('stop'));assert.equal(first.signal.aborted,true);
+  }finally{await h.manager.close();}
+});
+test('followup','unavailable autoplay recommendation removes queue without undefined server error',async()=>{
+  const h=harness();h.player.handler._getPluginFromSong=async()=>({getRelatedSongs:async()=>[]});
+  try{await h.manager.play(h.interaction());const q=h.player.getQueue(gid);q.toggleAutoplay();h.voice.stop();await waitFor(()=>!h.player.getQueue(gid));assert.equal(h.counts().plays,1);assert.equal(h.voice.audioPlayer.listenerCount('stateChange'),0);}finally{await h.manager.close();}
+});
+
 test('preservation','all 36 command definitions and handlers are unchanged',()=>{
   assert.equal(commandsJSON.length,36);assert.equal(new Set(commandsJSON.map(c=>c.name)).size,36);const index=fs.readFileSync(path.join(root,'index.js'),'utf8');for(const c of commandsJSON)assert.match(index,new RegExp(`case ["']${c.name}["']:`));
   const baseline=JSON.parse(fs.readFileSync(path.join(root,'tests/preserved-sha256.json')));for(const [name,hash] of Object.entries(baseline))assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root,name))).digest('hex'),hash,name);
 });
 
-for(const {group,name,fn} of tests.filter(t=>!process.env.TEST_GROUP || t.group===process.env.TEST_GROUP)){const start=Date.now();try{await fn();results.push({group,name,status:'PASS',ms:Date.now()-start});console.log('PASS',group,name);}catch(error){results.push({group,name,status:'FAIL',error:error.stack});console.error('FAIL',group,name,error.stack);}}
-const out=process.env.TEST_REPORT_DIR||path.join(root,'test-results');fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'test-results.json'),JSON.stringify({node:process.version,distube:dt.version,note:'Offline mocks, actual DisTube Queue/QueueManager, loopback HTTP, synthetic local FFmpeg audio. No YouTube/Discord voice validation.',results,audio},null,2)+'\n');
+for(const {group,name,fn} of tests.filter(t=>(!process.env.TEST_GROUP || t.group===process.env.TEST_GROUP) && (!process.env.TEST_NAME || new RegExp(process.env.TEST_NAME).test(t.name)))){const start=Date.now();try{await fn();results.push({group,name,status:'PASS',ms:Date.now()-start});console.log('PASS',group,name);}catch(error){results.push({group,name,status:'FAIL',error:error.stack});console.error('FAIL',group,name,error.stack);}}
+const out=process.env.TEST_REPORT_DIR||path.join(root,'test-results');fs.mkdirSync(out,{recursive:true});fs.writeFileSync(path.join(out,'test-results.json'),JSON.stringify({node:process.version,distube:dt.version,note:'Offline mocks, actual DisTube.play and Song/Playlist resolver plus Queue/QueueManager, loopback HTTP, synthetic local FFmpeg audio. No YouTube/Discord voice validation.',results,audio},null,2)+'\n');
 console.log(`${results.filter(r=>r.status==='PASS').length}/${results.length} tests passed. Report: ${out}`);
 fs.rmSync(tmp,{recursive:true,force:true});process.exitCode=results.some(r=>r.status==='FAIL')?1:0;

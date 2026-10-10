@@ -6,26 +6,36 @@ const diagnostic = require('./beatra_engine/src/core/diagnostics.js');
 
 // Adapter for the audited DisTube 5.2.3 lifecycle. No library files are modified.
 // An audio resource becoming Playing is evidence of local packet production, not audibility.
-export function instrumentMusic(player, { sessions, relay, report = diagnostic.event, notice = () => {} }) {
+export function instrumentMusic(player, { sessions, relay, report = diagnostic.event, notice = () => {},
+  onPlaySong = () => {}, onDeleteQueue = () => {}, onDisconnect = () => {} }) {
   const attempts = new WeakMap();
   const active = new Map();
   const pending = new Map();
   const errors = new WeakMap();
   const listeners = new Map();
+  const validGuild = value => {
+    try { return require('distube').resolveGuildId(value); } catch { return undefined; }
+  };
   const emit = (record, stage, outcome, extra = {}) => report('playback', {
     attemptId: record?.id, guild: diagnostic.guildTag(record?.guildId),
     source: record?.song?.source, stage, outcome, ...extra
   });
   function prepare(song, metadata = {}) {
-    song.metadata = { ...song.metadata, ...metadata };
-    const record = { id: randomUUID(), song, guildId: song.metadata.guildId, terminal: false, consumed: false };
+    const previous = attempts.get(song);
+    song.metadata = { ...song.metadata, ...previous?.metadata, ...metadata };
+    const queue = [...listeners.keys()].find(q => q.songs.includes(song));
+    const guildId = validGuild(queue?.id) || validGuild(song.metadata.guildId) || validGuild(song.member?.guild?.id);
+    if (guildId) song.metadata.guildId = guildId;
+    const record = { id: randomUUID(), song, guildId, terminal: false, consumed: false };
     song.metadata = { ...song.metadata, attemptId: record.id };
+    record.metadata = { ...song.metadata };
     attempts.set(song, record);
     return record;
   }
-  function finish(song, outcome, error) {
-    const record = attempts.get(song);
+  function finish(song, outcome, error, queue) {
+    const record = attempts.get(song) || (song && prepare(song, { guildId: queue?.id }));
     if (!record || record.terminal) return;
+    record.guildId ||= validGuild(queue?.id);
     const failure = error || relay.errorFor(song?.stream?.url);
     record.terminal = true;
     let result = failure ? 'failed' : outcome;
@@ -33,27 +43,42 @@ export function instrumentMusic(player, { sessions, relay, report = diagnostic.e
     emit(record, 'track_completion', result, { reason: failure ? diagnostic.classify(failure) : undefined,
       playedMs: record.resource?.playbackDuration || 0, expectedDurationMs: (song.duration || 0) * 1000 });
     if (active.get(record.guildId) === record) active.delete(record.guildId);
-    if (result === 'failed') {
-      errors.set(song, failure);
-      if (!record.awaitingRequest) notice(record.guildId, `❌ This track could not finish playing. Reference: ${record.id.slice(0, 8)}`);
-    }
-    relay.discard?.(song?.stream?.url);
+    try {
+      if (result === 'failed') {
+        errors.set(song, failure);
+        if (!record.awaitingRequest && record.guildId) {
+          // Neither a synchronous callback failure nor a rejected Discord send may
+          // escape an EventEmitter listener and abort DisTube's queue recovery.
+          const failedNotice = () => emit(record, 'notification', 'failed', { reason: 'NOTICE_FAILED' });
+          try {
+            Promise.resolve(notice(record.guildId, `❌ This track could not finish playing. Reference: ${record.id.slice(0, 8)}`, queue))
+              .catch(failedNotice);
+          } catch { failedNotice(); }
+        }
+      }
+    } finally { relay.discard?.(song?.stream?.url); }
   }
   const attach = player.handler.attachStreamInfo.bind(player.handler);
   player.handler.attachStreamInfo = async song => {
     let record = attempts.get(song);
     if (!record || record.consumed) record = prepare(song);
+    // DisTube.play resolves Song/Playlist again and replaces their metadata.
+    // Keep each track's ID and original cancellation signal across that step.
+    song.metadata = { ...song.metadata, ...record.metadata, attemptId: record.id };
     record.consumed = true;
     const controller = new AbortController();
-    const session = song.metadata?.signal || sessions.state(record.guildId).controller.signal;
-    song._bebotSignal = AbortSignal.any([session, controller.signal]);
     record.controller = controller;
-    active.set(record.guildId, record);
-    pending.set(record.guildId, record);
     const start = performance.now();
-    emit(record, 'discord_voice', player.getQueue?.(record.guildId)?.voice?.connection?.state?.status || 'unknown');
-    emit(record, 'stream_retrieval', 'started');
     try {
+      if (!record.guildId) throw Object.assign(new Error('Playback is missing its server context.'), { code: 'MISSING_GUILD_CONTEXT' });
+      const session = record.metadata.signal || sessions.state(record.guildId).controller.signal;
+      record.metadata.signal = session;
+      song.metadata.signal = session;
+      song._bebotSignal = AbortSignal.any([session, controller.signal]);
+      active.set(record.guildId, record);
+      pending.set(record.guildId, record);
+      emit(record, 'discord_voice', player.getQueue?.(record.guildId)?.voice?.connection?.state?.status || 'unknown');
+      emit(record, 'stream_retrieval', 'started');
       song._bebotSignal.throwIfAborted();
       // A reused Song must not keep an old relay URL after cancellation or failure.
       if (song.stream?.url) delete song.stream.url;
@@ -61,7 +86,7 @@ export function instrumentMusic(player, { sessions, relay, report = diagnostic.e
       song._bebotSignal.throwIfAborted();
       emit(record, 'stream_retrieval', 'ready', { elapsedMs: Math.round(performance.now() - start) });
     } catch (error) {
-      emit(record, 'stream_retrieval', song._bebotSignal.aborted ? 'cancelled' : 'failed', { reason: diagnostic.classify(error) });
+      emit(record, 'stream_retrieval', song._bebotSignal?.aborted ? 'cancelled' : 'failed', { reason: diagnostic.classify(error) });
       errors.set(song, error);
       throw error;
     } finally {
@@ -108,18 +133,22 @@ export function instrumentMusic(player, { sessions, relay, report = diagnostic.e
       voice.play = original;
     });
   });
-  player.on('playSong', (queue, song) => emit(attempts.get(song), 'player_dispatch', 'accepted'));
-  player.on('finishSong', (_queue, song) => finish(song, 'ended'));
+  player.on('playSong', (queue, song) => {
+    emit(attempts.get(song), 'player_dispatch', 'accepted');
+    onPlaySong(queue, song);
+  });
+  player.on('finishSong', (queue, song) => finish(song, 'ended', undefined, queue));
   player.on('error', (error, queue, song) => {
-    if (song) { errors.set(song, error); finish(song, 'failed', error); }
+    if (song) { errors.set(song, error); finish(song, 'failed', error, queue); }
     else report('playback', { guild: diagnostic.guildTag(queue?.id), stage: 'engine', outcome: 'failed', reason: diagnostic.classify(error) });
   });
   player.on('deleteQueue', queue => {
     const record = active.get(queue.id);
-    if (record) finish(record.song, 'queue_removed');
+    if (record) finish(record.song, 'queue_removed', undefined, queue);
     listeners.get(queue)?.(); listeners.delete(queue);
+    onDeleteQueue(queue);
   });
-  player.on('disconnect', queue => { sessions.cancel(queue.id); });
+  player.on('disconnect', queue => { sessions.cancel(queue.id); onDisconnect(queue); });
   return {
     prepare, errors, pending,
     async resolve(query, options) {
@@ -135,7 +164,7 @@ export function instrumentMusic(player, { sessions, relay, report = diagnostic.e
           const record = prepare(song, options.metadata);
           record.awaitingRequest = true;
           // Keep lookup and first playback linked; subsequent playlist tracks get their own IDs.
-          if (song === songs[0]) { record.id = id; song.metadata.attemptId = id; }
+          if (song === songs[0]) { record.id = id; song.metadata.attemptId = id; record.metadata.attemptId = id; }
         }
         report('playback', { ...fields, outcome: 'resolved', count: songs.length });
         return resolved;

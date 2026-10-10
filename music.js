@@ -72,20 +72,18 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
           ytDlp: yt.ok ? yt.output.split(/\r?\n/)[0] : 'unavailable',
           ffmpeg: ff.ok ? ff.output.split(/\r?\n/)[0] : 'unavailable' });
       }
-      runtime = instrumentMusic(instance, { sessions, relay, notice: (guildId, content) => {
-        const channel = instance.getQueue(guildId)?.textChannel;
-        if (channel) void channel.send({ content, allowedMentions: { parse: [] } }).catch(() => {});
-      } });
-      instance.on(Events.PLAY_SONG, (queue, song) => {
+      runtime = instrumentMusic(instance, { sessions, relay, notice: (guildId, content, queue) => {
+        if (!guildId) return;
+        const channel = queue?.textChannel || instance.getQueue(guildId)?.textChannel;
+        return channel?.send({ content, allowedMentions: { parse: [] } });
+      }, onPlaySong: (queue, song) => {
         cancelIdle(queue.id);
         if (autoplayPreferences.has(queue.id) && Boolean(queue.autoplay) !== autoplayPreferences.get(queue.id)) {
           try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
         }
-
-      });
+      }, onDisconnect: queue => { cancelIdle(queue.id); sessions.release(queue.id); },
+      onDeleteQueue: queue => { scheduleIdle(queue.id); sessions.release(queue.id); } });
       instance.on(Events.FINISH, queue => scheduleIdle(queue.id));
-      instance.on(Events.DISCONNECT, queue => { cancelIdle(queue.id); sessions.cancel(queue.id); sessions.release(queue.id); });
-      instance.on(Events.DELETE_QUEUE, queue => { scheduleIdle(queue.id); sessions.release(queue.id); });
       instance.on(Events.NO_RELATED, queue => diagnostic('playback', { stage: 'recommendations', outcome: 'unavailable' }));
       // Never subscribe raw DEBUG/FFMPEG_DEBUG messages: they contain source URLs/arguments.
       distube = instance;
@@ -147,8 +145,9 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
         const result = await runtime.resolve(query, options);
         signal.throwIfAborted();
         if ((current?.songs.length || 0) + (result.songs?.length || 1) > 500) throw new Error('The music queue is full.');
-        // Metadata is already attached. Passing it again would overwrite per-track attempt IDs.
-        try { await player.play(voice, result, { member, textChannel: interaction.channel }); }
+        // DisTube resolves this object again; omitted metadata clears its context.
+        // The runtime restores each playlist track's separate attempt ID at retrieval.
+        try { await player.play(voice, result, { ...options, metadata: result.metadata || options.metadata }); }
         finally { runtime.requestDone(result); }
         signal.throwIfAborted();
         const failure = runtime.errors.get(result.songs?.[0] || result);
