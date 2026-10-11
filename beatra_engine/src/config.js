@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('node:path');
+const { configuredCookies } = require('../../youtube_auth.cjs');
 
 require('dotenv').config({ path: path.join(__dirname, '..', '.env'), quiet: true });
 
@@ -77,7 +78,7 @@ const config = {
 
     ytdlp: {
         path: env('YTDLP_PATH'),
-        cookiesFile: env('COOKIES_FILE'),
+        cookiesFile: configuredCookies(),
         cookiesFromBrowser: env('COOKIES_FROM_BROWSER'),
         poToken: env('YOUTUBE_PO_TOKEN'),
         extractorArgs: env('YTDLP_EXTRACTOR_ARGS'),
