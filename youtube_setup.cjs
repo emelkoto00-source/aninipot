@@ -24,10 +24,11 @@ function ready(root = ROOT) {
     } catch { return false; }
 }
 
-function providerArgs({ root = ROOT, useProvider = enabled() } = {}) {
+function providerArgs({ root = ROOT, useProvider = enabled(), authenticated = false } = {}) {
     if (!useProvider || !ready(root)) return [];
     return ['--plugin-dirs', path.join(root, 'plugins'),
-        '--extractor-args', 'youtube:player_client=mweb',
+        // Let yt-dlp select its supported authenticated clients when cookies are supplied.
+        ...(authenticated ? [] : ['--extractor-args', 'youtube:player_client=mweb']),
         '--extractor-args', `youtubepot-bgutilscript:server_home=${serverHome(root)}`];
 }
 
