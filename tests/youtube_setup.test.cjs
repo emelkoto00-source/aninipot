@@ -23,6 +23,9 @@ test('incomplete provider never adds broken extraction flags; configured opt-out
         const args = providerArgs({ root });
         assert.ok(args.includes('youtube:player_client=mweb'));
         assert.ok(args.includes(`youtubepot-bgutilscript:server_home=${server}`));
+        const signedIn = providerArgs({ root, authenticated: true });
+        assert.ok(signedIn.includes('--plugin-dirs'));
+        assert.ok(!signedIn.some(arg => arg.includes('player_client=')));
         assert.deepEqual(providerArgs({ root, useProvider: false }), []);
         fs.unlinkSync(path.join(server, 'build', 'generate_once.js'));
         assert.deepEqual(providerArgs({ root }), []);
