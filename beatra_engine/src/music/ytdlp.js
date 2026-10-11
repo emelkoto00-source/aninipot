@@ -46,7 +46,7 @@ function baseArgs({ proxy = null, settings = config.ytdlp } = {}) {
         '--socket-timeout', '10',
         '--retries', '2',
         '--js-runtimes', `node:${process.execPath}`,
-        ...providerArgs(),
+        ...providerArgs({ authenticated: Boolean(settings.cookiesFile || settings.cookiesFromBrowser) }),
     ];
 
     if (settings.cookiesFile) args.push('--cookies', settings.cookiesFile);
