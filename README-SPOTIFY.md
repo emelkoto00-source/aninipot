@@ -12,7 +12,9 @@ Never commit these values, pairing archives, or runtime data. Pair Soloist on th
 
 `/play` accepts full `https://open.spotify.com/track/...`, `/album/...`, and `/playlist/...` links, including `intl-xx` paths, and matching Spotify URIs. Tracks and playlists retain their Spotify identity. A new-track announcement contains the title, duration, requester, and artwork.
 
-Spotify sessions support `/pause`, `/resume`, `/skip`, `/next`, `/stop`, `/leave`, `/volume`, `/queue`, `/nowplaying`, and `/247`. Individual track requests can be added to a running Spotify queue. Use `/stop` before switching between Spotify and YouTube/SoundCloud, or starting another playlist/album. One Spotify account serves one voice channel at a time. Spotify manages its own recommendations; `/autoplay` remains a YouTube control. Spotify listening time is not currently included in the existing DisTube profile statistics.
+Spotify sessions support `/pause`, `/resume`, `/skip`, `/next`, `/stop`, `/leave`, `/volume`, `/queue`, `/nowplaying`, and `/247`. Individual track requests can be added to a running Spotify queue. Use `/stop` before switching between Spotify and YouTube/SoundCloud, or starting another playlist/album. One Spotify account serves one voice channel at a time. Spotify manages its own recommendations; `/autoplay` remains a YouTube control.
+
+The listening profile counts Spotify tracks and Spotify autoplay for human members in the bot's voice channel while audio is playing. Paused, buffering, and disconnected sessions do not earn time. The tracker samples every 20 seconds and saves every minute to `BEBOT_DATA_DIR` (default `./data`). Mount persistent storage at that directory to retain profiles across deployments. Listening before this integration was enabled cannot be reconstructed.
 
 The client restores its approved pairing after a container replacement. Builds expire after 90 days; the official client is refreshed at startup when the locally cached build is older than a day. If the pairing is revoked, pair again and replace the private state. An optional Spotify setup failure does not stop the bot's existing YouTube startup.
 
