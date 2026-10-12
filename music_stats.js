@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // Voice-channel co-listening statistics. Nobody's Discord private friends list is read.
-// Records only while DisTube reports an active, unpaused song.
+// Records only while the active source reports an unpaused song in voice.
 const TICK_MS = 20_000;
 const MAX_INTERVAL_MS = 25_000;
 const MAX_TRACKS_PER_USER = 200;

@@ -231,5 +231,14 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       return reply(interaction, 'That control is unavailable for Spotify.');
     } catch { return reply(interaction, '❌ The Spotify control failed. Please try again.'); }
   }
-  return { has, play, control, close: async () => { await end(); await runtime?.close(); } };
+  function getListeningQueue(guildId) {
+    const session = active;
+    if (!session || session.guildId !== guildId || session.closed || starting === session ||
+        session.state?.status !== 'playing' || !session.state.is_active ||
+        session.player?.state?.status !== 'playing' || session.connection?.state?.status !== 'ready') return null;
+    // Read the latest item so each Spotify recommendation earns its own credit.
+    return { playing: true, paused: false, songs: [spotifySong(session.state.item, session.requesterId)],
+      voiceChannel: client.guilds.cache.get(guildId)?.channels.cache.get(session.voiceId) };
+  }
+  return { has, play, control, getListeningQueue, close: async () => { await end(); await runtime?.close(); } };
 }

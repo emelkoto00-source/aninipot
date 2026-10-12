@@ -11,19 +11,23 @@ import { createSpotifyManager, spotifyUri } from './spotify_music.js';
 const require = createRequire(import.meta.url);
 const { RecentTracks } = require('./beatra_engine/src/music/recommendations.js');
 
-export function createMusicManager(client, { engineFactory, statsFactory = createListeningStats, recommendations = new RecentTracks() } = {}) {
+export function createMusicManager(client, { engineFactory, statsFactory = createListeningStats, spotifyFactory = createSpotifyManager, recommendations = new RecentTracks() } = {}) {
   let distube = null;
   let initialization = null;
   let startupError = null;
   const idleTimers = new Map();
   const stayConnected = new Set();
   const autoplayPreferences = new Map();
-  const stats = statsFactory(client, () => distube);
+  const spotify = spotifyFactory(client);
+  // The profile samples one active source per guild, including Spotify autoplay.
+  const stats = statsFactory(client, () => ({
+    getQueue: guildId => spotify.getListeningQueue(guildId) || distube?.getQueue(guildId),
+    voices: { get: guildId => distube?.voices.get(guildId) }
+  }));
   const sessions = new MusicSessions();
   const preparing = new Map();
   let runtime;
   let relay;
-  const spotify = createSpotifyManager(client);
 
   const { redact, event: diagnostic, classify } = require("./beatra_engine/src/core/diagnostics.js");
 
