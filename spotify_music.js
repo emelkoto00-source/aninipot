@@ -84,8 +84,10 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
     await runtime?.control.request('pause').catch(() => {});
     if (active === session) active = null;
   }
-  async function fail(session) {
+  async function fail(session, reason = 'UNKNOWN') {
     if (session.closed) return;
+    // Fixed reason codes only: never log credentials, session data, or raw errors.
+    console.error(`[Spotify] Playback disconnected: ${reason}`);
     await end(session);
     session.textChannel?.send({ content: '❌ Spotify playback disconnected. Try `/play` again.', allowedMentions: { parse: [] } }).catch(() => {});
   }
@@ -96,7 +98,7 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       const state = await runtime.control.request('get_state');
       if (session.closed) return;
       session.state = state;
-      if (!state.is_active) return fail(session);
+      if (!state.is_active) return fail(session, 'DEVICE_INACTIVE');
       const changed = state.item?.uri && state.item.uri !== session.lastUri;
       if (state.status === 'playing' && changed) {
         // Do not broadcast an unrelated context selected from the owner's Spotify app.
@@ -108,7 +110,7 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
         await session.textChannel?.send({ embeds: [buildNowPlayingEmbed({}, session.song)], allowedMentions: { parse: [] } }).catch(() => {});
       }
       if (state.status === 'idle' && !session.keepAlive) await end(session);
-    } catch { if (!session.closed) await fail(session); }
+    } catch { if (!session.closed) await fail(session, 'STATE_QUERY_FAILED'); }
     finally { session.updating = false; }
   }
 
@@ -149,13 +151,15 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       await api.entersState(session.connection, api.VoiceConnectionStatus.Ready, 20_000);
       if (session.closed) throw new Error('Cancelled');
       session.player = api.createAudioPlayer({ behaviors: { noSubscriber: api.NoSubscriberBehavior.Pause } });
-      session.audio = spawnImpl(rt.parec, ['--device=spotify_bebot.monitor', '--format=s16le', '--rate=48000', '--channels=2', '--raw'],
+      // Discord consumes a frame every 20 ms. PulseAudio's default capture buffer
+      // arrives in large bursts and can starve the player between those bursts.
+      session.audio = spawnImpl(rt.parec, ['--device=spotify_bebot.monitor', '--format=s16le', '--rate=48000', '--channels=2', '--raw', '--latency-msec=20', '--process-time-msec=20'],
         { env: rt.env, stdio: ['ignore', 'pipe', 'ignore'] });
-      session.audio.on('error', () => void fail(session));
-      session.audio.on('exit', () => { if (!session.closed) void fail(session); });
-      session.player.on('error', () => void fail(session));
+      session.audio.on('error', () => void fail(session, 'AUDIO_CAPTURE_ERROR'));
+      session.audio.on('exit', () => { if (!session.closed) void fail(session, 'AUDIO_CAPTURE_EXIT'); });
+      session.player.on('error', () => void fail(session, 'DISCORD_AUDIO_ERROR'));
       session.connection.on('stateChange', (_old, next) => {
-        if (['disconnected', 'destroyed'].includes(next.status) && !session.closed) void fail(session);
+        if (['disconnected', 'destroyed'].includes(next.status) && !session.closed) void fail(session, 'DISCORD_VOICE_DISCONNECTED');
       });
       session.connection.subscribe(session.player);
       session.player.play(api.createAudioResource(session.audio.stdout, { inputType: api.StreamType.Raw }));
@@ -178,7 +182,7 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       session.lastUri = session.state.item.uri;
       session.unwatch = rt.control.watch(event => {
         if (['track_changed', 'playback_changed', 'device_changed'].includes(event.type)) void update(session);
-      }, () => void fail(session));
+      }, () => void fail(session, 'EVENT_CONNECTION_CLOSED'));
       session.poll = setInterval(() => void update(session), 5_000); session.poll.unref?.();
       await interaction.editReply({ embeds: [buildRequestEmbed(session.song)], allowedMentions: { parse: [] } });
       await session.textChannel?.send({ embeds: [buildNowPlayingEmbed({}, session.song)], allowedMentions: { parse: [] } }).catch(() => {});
