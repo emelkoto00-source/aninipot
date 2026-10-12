@@ -5,6 +5,7 @@ import { MusicSessions } from "./music_session.js";
 import { configureSoundCloud } from "./music_sources.js";
 import { instrumentMusic } from "./music_runtime.js";
 import { announceNowPlaying, buildNowPlayingEmbed, buildRequestEmbed } from "./music_embeds.js";
+import { createSpotifyManager, spotifyUri } from './spotify_music.js';
 
 // Music commands retain the existing DisTube engine with cancellable per-guild requests.
 const require = createRequire(import.meta.url);
@@ -22,6 +23,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
   const preparing = new Map();
   let runtime;
   let relay;
+  const spotify = createSpotifyManager(client);
 
   const { redact, event: diagnostic, classify } = require("./beatra_engine/src/core/diagnostics.js");
 
@@ -119,6 +121,13 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
   }
 
   async function play(interaction) {
+    if (spotifyUri(interaction.options.getString('query', true))) {
+      return spotify.play(interaction, {
+        legacyBusy: () => Boolean(distube?.getQueue(interaction.guildId) || preparing.get(interaction.guildId)?.size),
+        releaseLegacy: async () => { cancelIdle(interaction.guildId); if (distube?.voices.get(interaction.guildId)) distube.voices.leave(interaction.guildId); }
+      });
+    }
+    if (spotify.has(interaction.guildId)) return interaction.reply({ content: 'Use `/stop` before switching the Spotify session to YouTube or SoundCloud.', flags: 64 });
     if (!interaction.inGuild()) return interaction.reply({ content: "Use `/play` in your Discord server.", ephemeral: true });
     if ((preparing.get(interaction.guildId)?.size || 0) >= 10) return interaction.reply({ content: 'Too many music requests are waiting. Please try again shortly.', ephemeral: true });
     const signal = sessions.state(interaction.guildId).controller.signal;
@@ -183,6 +192,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
   }
 
   async function stop(interaction) {
+    if (spotify.has(interaction.guildId)) return spotify.control(interaction);
     if (!interaction.inGuild()) return interaction.reply({ content: "Use this command inside your server.", ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     const id = interaction.guildId;
@@ -215,6 +225,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
 
   // Playback controls are isolated from the working yt-dlp extractor and relay.
   async function control(interaction) {
+    if (spotify.has(interaction.guildId)) return spotify.control(interaction);
     if (['stop', 'leave'].includes(interaction.commandName)) return stop(interaction);
     if (!interaction.inGuild()) return interaction.reply({ content: 'Use music commands in the Discord server.', ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
@@ -321,6 +332,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
   }
 
   async function close() {
+    await spotify.close();
     const draining = sessions.close();
     relay?.close();
     await draining;
