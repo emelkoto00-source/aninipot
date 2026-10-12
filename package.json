@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "build": "node youtube_setup.cjs",
-    "prestart": "node youtube_setup.cjs",
+    "prestart": "node youtube_setup.cjs && node spotify_setup.cjs",
     "start": "node index.js",
     "deploy-commands": "node register-commands.js"
   },
