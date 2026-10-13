@@ -4,7 +4,7 @@ import { createListeningStats } from "./music_stats.js";
 import { MusicSessions } from "./music_session.js";
 import { configureSoundCloud } from "./music_sources.js";
 import { instrumentMusic } from "./music_runtime.js";
-import { announceNowPlaying, buildNowPlayingEmbed, buildRequestEmbed } from "./music_embeds.js";
+import { createNowPlayingAnnouncer, buildNowPlayingEmbed, buildRequestEmbed } from "./music_embeds.js";
 import { createSpotifyManager, spotifyUri } from './spotify_music.js';
 
 // Music commands retain the existing DisTube engine with cancellable per-guild requests.
@@ -19,6 +19,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
   const stayConnected = new Set();
   const autoplayPreferences = new Map();
   const spotify = spotifyFactory(client);
+  const announcements = createNowPlayingAnnouncer();
   // The profile samples one active source per guild, including Spotify autoplay.
   const stats = statsFactory(client, () => ({
     getQueue: guildId => spotify.getListeningQueue(guildId) || distube?.getQueue(guildId),
@@ -91,9 +92,11 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
         if (autoplayPreferences.has(queue.id) && Boolean(queue.autoplay) !== autoplayPreferences.get(queue.id)) {
           try { queue.toggleAutoplay(); } catch (err) { console.warn('[DisTube] Could not set autoplay:', redact(err)); }
         }
-        void announceNowPlaying(queue, song, diagnostic);
-      }, onDisconnect: queue => { cancelIdle(queue.id); sessions.release(queue.id); },
-      onDeleteQueue: queue => { scheduleIdle(queue.id); sessions.release(queue.id); } });
+        announcements.start(queue.id, queue.textChannel, song, () => instance.getQueue(queue.id)?.songs[0] === song ? queue : null);
+      }, onTrackEnd: (queue, _song, result) => {
+        if (queue) announcements.stop(queue.id, result === 'ended' ? '✓ Finished' : result === 'failed' ? '⚠ Playback ended' : '⏹ Stopped / skipped');
+      }, onDisconnect: queue => { announcements.stop(queue.id); cancelIdle(queue.id); sessions.release(queue.id); },
+      onDeleteQueue: queue => { announcements.stop(queue.id); scheduleIdle(queue.id); sessions.release(queue.id); } });
       instance.on(Events.FINISH, queue => scheduleIdle(queue.id));
       instance.on(Events.NO_RELATED, queue => {
         diagnostic('playback', { stage: 'recommendations', outcome: 'unavailable' });
@@ -336,6 +339,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
   }
 
   async function close() {
+    announcements.close();
     await spotify.close();
     const draining = sessions.close();
     relay?.close();
