@@ -7,7 +7,7 @@ const diagnostic = require('./beatra_engine/src/core/diagnostics.js');
 // Adapter for the audited DisTube 5.2.3 lifecycle. No library files are modified.
 // An audio resource becoming Playing is evidence of local packet production, not audibility.
 export function instrumentMusic(player, { sessions, relay, report = diagnostic.event, notice = () => {},
-  onPlaySong = () => {}, onDeleteQueue = () => {}, onDisconnect = () => {} }) {
+  onPlaySong = () => {}, onTrackEnd = () => {}, onDeleteQueue = () => {}, onDisconnect = () => {} }) {
   const attempts = new WeakMap();
   const active = new Map();
   const pending = new Map();
@@ -43,6 +43,7 @@ export function instrumentMusic(player, { sessions, relay, report = diagnostic.e
     emit(record, 'track_completion', result, { reason: failure ? diagnostic.classify(failure) : undefined,
       playedMs: record.resource?.playbackDuration || 0, expectedDurationMs: (song.duration || 0) * 1000 });
     if (active.get(record.guildId) === record) active.delete(record.guildId);
+    onTrackEnd(queue, song, result);
     try {
       if (result === 'failed') {
         errors.set(song, failure);

@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import { PermissionFlagsBits, EmbedBuilder, escapeMarkdown } from 'discord.js';
-import { buildNowPlayingEmbed, buildRequestEmbed } from './music_embeds.js';
+import { createNowPlayingAnnouncer, buildNowPlayingEmbed, buildRequestEmbed } from './music_embeds.js';
 const require = createRequire(import.meta.url);
 
 export function spotifyUri(input) {
@@ -24,6 +24,13 @@ export function spotifySong(item, requesterId) {
     duration: Number(info.playback?.duration_ms || 0) / 1000,
     thumbnail: info.visual_identity?.cover?.find(x => x.size === 'default')?.url || info.visual_identity?.cover?.[0]?.url,
     metadata: { requesterId } };
+}
+
+export function spotifyPosition(state, now = Date.now()) {
+  const anchor = state?.position || {};
+  const elapsed = state?.status === 'playing' && Number.isFinite(anchor.timestamp_ms)
+    ? Math.max(0, now - anchor.timestamp_ms) * Math.max(0, Number(anchor.speed) || 0) : 0;
+  return Math.max(0, (Number(anchor.position_ms) || 0) + elapsed) / 1000;
 }
 
 // Each command uses a separate local connection: Soloist has no request IDs.
@@ -67,6 +74,10 @@ export class SoloistControl extends EventEmitter {
 
 export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnImpl = spawn } = {}) {
   let active = null, starting = null, runtime = null;
+  const announcements = createNowPlayingAnnouncer();
+  const view = session => session.closed ? null : ({ paused: session.state?.status === 'paused',
+    buffering: session.state?.status === 'buffering', currentTime: spotifyPosition(session.state) });
+  const announce = session => announcements.start(session.guildId, session.textChannel, session.song, () => view(session));
   const voice = () => voiceApi || require('@discordjs/voice');
   const ensureRuntime = async () => runtime ||= await (runtimeFactory ? runtimeFactory() : require('./spotify_runtime.cjs').start());
   const enabled = () => Boolean(runtimeFactory || process.env.BEBOT_SPOTIFY === '1');
@@ -76,6 +87,7 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
 
   async function end(session = active) {
     if (!session || session.closed) return;
+    announcements.stop(session.guildId);
     session.closed = true;
     clearInterval(session.poll); clearTimeout(session.idle);
     for (const cleanup of [() => session.unwatch?.(), () => session.audio?.kill(), () => session.player?.stop(), () => session.connection?.destroy()]) {
@@ -88,8 +100,36 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
     if (session.closed) return;
     // Fixed reason codes only: never log credentials, session data, or raw errors.
     console.error(`[Spotify] Playback disconnected: ${reason}`);
+    announcements.stop(session.guildId, '⚠ Playback ended');
     await end(session);
     session.textChannel?.send({ content: '❌ Spotify playback disconnected. Try `/play` again.', allowedMentions: { parse: [] } }).catch(() => {});
+  }
+  async function startPending(session) {
+    const next = session.pending.shift();
+    if (!next || session.closed) return false;
+    announcements.stop(session.guildId, '✓ Finished');
+    try {
+      await runtime.control.request('play', { uri: next.uri });
+      const deadline = Date.now() + 15000;
+      while (!session.closed && Date.now() < deadline) {
+        const state = await runtime.control.request('get_state');
+        if (session.closed) return false;
+        const matches = next.uri.startsWith('spotify:track:') ? state.item?.uri === next.uri : state.context?.uri === next.uri;
+        if (matches && state.status === 'playing') {
+          session.context = next.uri; session.requesterId = next.requesterId;
+          session.state = state; session.lastUri = state.item?.uri;
+          session.song = spotifySong(state.item, next.requesterId);
+          session.upcoming = [];
+          announce(session);
+          return true;
+        }
+        await new Promise(r => setTimeout(r, 250));
+      }
+      if (!session.closed) throw Error('Queued context did not start');
+    } catch {
+      if (!session.closed) await session.textChannel?.send({ content: '⚠ A queued Spotify request could not start. Check that its link is available to this Spotify account.', allowedMentions: { parse: [] } }).catch(() => {});
+    }
+    return false;
   }
   async function update(session) {
     if (session.closed || session.updating) return;
@@ -100,6 +140,13 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       session.state = state;
       if (!state.is_active) return fail(session, 'DEVICE_INACTIVE');
       const changed = state.item?.uri && state.item.uri !== session.lastUri;
+      // Queue entries distinguish playlist context from recommendations. Never switch
+      // just because a duration timer expires or the upcoming page is incomplete.
+      const nextSource = session.upcoming?.find(x => x.item?.uri === state.item?.uri)?.source;
+      if (session.pending.length && (state.status === 'idle' || (changed && nextSource === 'autoplay'))) {
+        await startPending(session);
+        return;
+      }
       if (state.status === 'playing' && changed) {
         // Do not broadcast an unrelated context selected from the owner's Spotify app.
         if (state.context?.uri !== session.context && !session.queued.has(state.item.uri)) return end(session);
@@ -107,9 +154,16 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
         session.queued.delete(state.item.uri);
         session.lastUri = state.item.uri;
         session.song = spotifySong(state.item, requester);
-        await session.textChannel?.send({ embeds: [buildNowPlayingEmbed({}, session.song)], allowedMentions: { parse: [] } }).catch(() => {});
+        announce(session);
       }
-      if (state.status === 'idle' && !session.keepAlive) await end(session);
+      if (session.pending.length) {
+        try { const q = await runtime.control.request('get_queue', { limit: 0 }); session.upcoming = q.upcoming || []; }
+        catch { /* keep prior boundary evidence; queue lookup must not stop audio */ }
+      }
+      if (state.status === 'idle') {
+        announcements.stop(session.guildId, '✓ Finished');
+        if (!session.keepAlive) await end(session);
+      }
     } catch { if (!session.closed) await fail(session, 'STATE_QUERY_FAILED'); }
     finally { session.updating = false; }
   }
@@ -130,15 +184,30 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
     if (active && (active.guildId !== interaction.guildId || active.voiceId !== channel.id)) return reply(interaction, 'Spotify is already active in another voice channel.');
     if (legacyBusy?.()) return reply(interaction, 'Use `/stop` before switching the current queue to Spotify.');
     if (active) {
-      if (!uri.startsWith('spotify:track:')) return reply(interaction, 'Use `/stop` before starting a different Spotify playlist or album. You can add individual tracks to this queue.');
+      const session = active;
       try {
-        await runtime.control.request('add_to_queue', { uri });
-        active.queued.set(uri, interaction.user.id);
-        return reply(interaction, '✓ Added the Spotify track to the queue.');
-      } catch { return reply(interaction, '❌ Could not queue that Spotify track.'); }
+        const add = session.enqueueTail.catch(() => {}).then(async () => {
+          if (session.closed) throw Error('Session stopped');
+          if (!uri.startsWith('spotify:track:') || session.pending.length) {
+            if (session.pending.length >= 50) throw Error('Queue full');
+            // Snapshot before accepting so a context-to-autoplay transition is observable.
+            const q = await runtime.control.request('get_queue', { limit: 0 });
+            if (session.closed) throw Error('Session stopped');
+            session.upcoming = q.upcoming || [];
+            session.pending.push({ uri, requesterId: interaction.user.id });
+            return `✓ Queued Spotify ${uri.split(':')[1]} · ${session.pending.length} waiting. It will play after the current playlist and earlier requests.`;
+          }
+          await runtime.control.request('add_to_queue', { uri });
+          if (session.closed) throw Error('Session stopped');
+          session.queued.set(uri, interaction.user.id);
+          return '✓ Added the Spotify track to the queue.';
+        });
+        session.enqueueTail = add;
+        return reply(interaction, await add);
+      } catch { return reply(interaction, '❌ Could not queue that Spotify request. Please try again.'); }
     }
     const session = { guildId: interaction.guildId, voiceId: channel.id, textChannel: interaction.channel,
-      requesterId: interaction.user.id, context: uri, queued: new Map(), closed: false, keepAlive: false };
+      requesterId: interaction.user.id, context: uri, queued: new Map(), pending: [], upcoming: [], enqueueTail: Promise.resolve(), closed: false, keepAlive: false };
     starting = session; active = session;
     try {
       const rt = await ensureRuntime();
@@ -181,11 +250,12 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       session.song = spotifySong(session.state.item, interaction.user.id);
       session.lastUri = session.state.item.uri;
       session.unwatch = rt.control.watch(event => {
+        if (event.type === 'position_sync' && session.state) session.state = { ...session.state, position: event.position };
         if (['track_changed', 'playback_changed', 'device_changed'].includes(event.type)) void update(session);
       }, () => void fail(session, 'EVENT_CONNECTION_CLOSED'));
       session.poll = setInterval(() => void update(session), 5_000); session.poll.unref?.();
       await interaction.editReply({ embeds: [buildRequestEmbed(session.song)], allowedMentions: { parse: [] } });
-      await session.textChannel?.send({ embeds: [buildNowPlayingEmbed({}, session.song)], allowedMentions: { parse: [] } }).catch(() => {});
+      announce(session);
     } catch {
       await end(session);
       await reply(interaction, '❌ Spotify playback could not start. Check the bot’s Spotify setup.');
@@ -206,17 +276,27 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       if (starting === session) return reply(interaction, 'Spotify is still loading. Use `/stop` to cancel.');
       if (command === 'pause' || command === 'resume') {
         await runtime.control.request(command === 'pause' ? 'pause' : 'play');
+        await update(session);
         return reply(interaction, command === 'pause' ? '⏸️ Paused playback.' : '▶️ Resumed playback.');
       }
-      if (command === 'skip' || command === 'next') { await runtime.control.request('skip_next'); return reply(interaction, '⏭️ Skipped to the next Spotify track.'); }
+      if (command === 'skip' || command === 'next') {
+        const previous = session.lastUri;
+        await runtime.control.request('skip_next');
+        // A track event may already have installed the next card before the acknowledgement.
+        if (session.lastUri === previous) announcements.stop(session.guildId, '⏭ Skipped');
+        await update(session);
+        return reply(interaction, '⏭️ Skipped to the next Spotify track.');
+      }
       if (command === 'volume') { const volume = Math.max(0, Math.min(100, interaction.options.getInteger('level', true))); await runtime.control.request('set_volume', { volume }); return reply(interaction, `🔊 Volume set to **${volume}%**.`); }
       if (command === 'nowplaying') {
         const s = await runtime.control.request('get_state');
-        return interaction.editReply({ embeds: [buildNowPlayingEmbed({ paused: s.status === 'paused', currentTime: s.position?.position_ms / 1000 }, spotifySong(s.item, session.song?.metadata?.requesterId), { snapshot: true })], allowedMentions: { parse: [] } });
+        return interaction.editReply({ embeds: [buildNowPlayingEmbed({ paused: s.status === 'paused', currentTime: spotifyPosition(s) }, spotifySong(s.item, session.song?.metadata?.requesterId))], allowedMentions: { parse: [] } });
       }
       if (command === 'queue') {
         const q = await runtime.control.request('get_queue', { limit: 0 });
-        const entries = [session.state.item, ...(q.upcoming || []).map(x => x.item)].filter(Boolean);
+        const upcoming = q.upcoming || [];
+        const entries = [session.state.item, ...upcoming.filter(x => !session.pending.length || x.source !== 'autoplay').map(x => x.item),
+          ...session.pending.map(x => ({ uri: x.uri, decorations: { identity: { name: `Queued Spotify ${x.uri.split(':')[1]} · https://open.spotify.com/${x.uri.split(':').slice(1).join('/')}` } } }))].filter(Boolean);
         const page = interaction.options.getInteger('page') || 1, pages = Math.max(1, Math.ceil(entries.length / 8));
         if (page > pages) return reply(interaction, `Choose a page from 1 to ${pages}.`);
         const lines = entries.slice((page - 1) * 8, page * 8).map((item, i) => `${(page - 1) * 8 + i + 1}. ${escapeMarkdown(spotifySong(item).name.slice(0, 100))}`);

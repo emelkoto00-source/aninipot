@@ -42,10 +42,11 @@ test('control waits for the matching acknowledgement and refuses unauthenticated
 
 function fixture() {
   const commands=[],messages=[];
+  let watcher,upcoming=[];
   let playback={status:'paused',is_active:true,item,context:{uri},position:{position_ms:0}};
   const rt={parec:'fixture',env:{},close:async()=>{},control:{
-    request:async(command,fields={})=>{commands.push([command,fields]);if(command==='get_auth_state')return{logged_in:true};if(command==='play')playback={...playback,status:'playing',context:{uri:fields.uri||uri}};if(command==='pause')playback.status='paused';return command==='get_state'?playback:{};},
-    watch:()=>()=>{}
+    request:async(command,fields={})=>{commands.push([command,fields]);if(command==='get_auth_state')return{logged_in:true};if(command==='get_queue')return{upcoming};if(command==='play')playback={...playback,status:'playing',context:{uri:fields.uri||uri}};if(command==='pause')playback.status='paused';return command==='get_state'?structuredClone(playback):{};},
+    watch:cb=>{watcher=cb;return()=>{};}
   }};
   const channel={id:'voice',permissionsFor:()=>({has:()=>true})};
   const connection=new EventEmitter();connection.subscribe=()=>{};connection.destroy=()=>{};
@@ -53,7 +54,7 @@ function fixture() {
   const audio=new EventEmitter();audio.stdout=new PassThrough();audio.kill=()=>{};
   const api={joinVoiceChannel:()=>connection,entersState:async()=>{},VoiceConnectionStatus:{Ready:'ready'},createAudioPlayer:()=>player,NoSubscriberBehavior:{Pause:'pause'},createAudioResource:x=>x,StreamType:{Raw:'raw'}};
   const interaction=(query=uri,commandName='play',voiceId='voice')=>({commandName,guildId:'guild',inGuild:()=>true,user:{id:'123456789012345678'},channel:{send:async m=>messages.push(m)},guild:{members:{me:{},fetch:async()=>({voice:{channel,channelId:voiceId}})}},memberPermissions:{has:()=>false},options:{getString:()=>query,getInteger:()=>1},deferReply:async()=>{},reply:async m=>messages.push(m),editReply:async m=>messages.push(m)});
-  return {commands,messages,interaction,rt,api,audio};
+  return {commands,messages,interaction,rt,api,audio,setQueue:q=>upcoming=q,setState:s=>playback={...playback,...s},refresh:async()=>{watcher({type:'track_changed'});await new Promise(r=>setImmediate(r));}};
 }
 test('original Spotify track starts voice, announces, queues tracks, and stops with access checks',async()=>{
   const f=fixture(), m=createSpotifyManager({}, {runtimeFactory:async()=>f.rt,voiceApi:f.api,spawnImpl:()=>f.audio});
@@ -65,6 +66,28 @@ test('original Spotify track starts voice, announces, queues tracks, and stops w
     await m.control(f.interaction(uri,'stop','other'));assert.equal(m.has('guild'),true);
     await m.control(f.interaction(uri,'stop'));assert.equal(m.has('guild'),false);
   } finally { await m.close(); }
+});
+
+test('Spotify playlists append in order, wait through context tracks, then replace autoplay at the boundary',async()=>{
+ const f=fixture(),m=createSpotifyManager({}, {runtimeFactory:async()=>f.rt,voiceApi:f.api,spawnImpl:()=>f.audio});
+ const a='spotify:playlist:4NKYNvRkGkbe45PPK3Usoi',b='spotify:playlist:37i9dQZF1DXcBWIGoYBM5M',c='spotify:album:4aawyAB9vmqN3uQ7FjRGTy';
+ const contextTrack={...item,uri:'spotify:track:57Z71Snhwx82laEb6rdZPB'},recommendation={...item,uri:'spotify:track:2JRo0gjbX4GrCqBYdRohoo'};
+ try {
+  await m.play(f.interaction(a));
+  f.setQueue([{source:'context',item:contextTrack},{source:'autoplay',item:recommendation}]);
+  await Promise.all([m.play(f.interaction(b)),m.play(f.interaction(c))]);
+  assert.deepEqual(f.commands.filter(([x,p])=>x==='play'&&p.uri).map(([,p])=>p.uri),[a]);
+  f.setState({item:contextTrack});await f.refresh();
+  assert.equal(f.commands.filter(([x,p])=>x==='play'&&p.uri).length,1);
+  f.setState({item:recommendation});await f.refresh();
+  assert.deepEqual(f.commands.filter(([x,p])=>x==='play'&&p.uri).map(([,p])=>p.uri),[a,b]);
+  await m.control(f.interaction(uri,'queue'));assert.match(f.messages.at(-1).embeds[0].data.description,/Queued Spotify album/);
+  f.setState({status:'idle'});await f.refresh();
+  assert.deepEqual(f.commands.filter(([x,p])=>x==='play'&&p.uri).map(([,p])=>p.uri),[a,b,c]);
+  await m.play(f.interaction(a));await m.control(f.interaction(uri,'stop'));
+  f.setState({status:'idle'});await f.refresh();
+  assert.equal(f.commands.filter(([x,p])=>x==='play'&&p.uri).length,3);
+ }finally{await m.close();}
 });
 test('existing YouTube queue blocks Spotify without sending playback commands',async()=>{
   const f=fixture(),m=createSpotifyManager({}, {runtimeFactory:async()=>f.rt,voiceApi:f.api});
