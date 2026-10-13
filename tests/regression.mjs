@@ -433,7 +433,8 @@ test('announcements','nowplaying uses the same design and pause state with a rea
   const h=harness();try {
     await h.manager.play(h.interaction());h.voice.playbackTime=65;
     await h.manager.control(h.interaction('pause'));
-    const i=h.interaction('nowplaying');await h.manager.control(i);
+    const i=h.interaction('nowplaying');let deferred;i.deferReply=async options=>{deferred=options;};await h.manager.control(i);
+    assert.deepEqual(deferred,{},'nowplaying must be public');
     const e=i.replies.at(-1).embeds[0].toJSON();assert.match(e.title,/Paused/);
     assert.match(e.description,/1:05 \/ 4:00/);
     assert.equal(e.fields,undefined);assert.equal(e.author,undefined);assert.equal(e.footer,undefined);
@@ -573,8 +574,26 @@ test('exact-link','a different resolved video identity is never accepted for a p
   await assert.rejects(p.resolve('https://youtu.be/_m7MiuCqVxk'),/identity/);
 });
 
-test('preservation','all 36 command definitions and handlers are unchanged',()=>{
-  assert.equal(commandsJSON.length,36);assert.equal(new Set(commandsJSON.map(c=>c.name)).size,36);const index=fs.readFileSync(path.join(root,'index.js'),'utf8');for(const c of commandsJSON)assert.match(index,new RegExp(`case ["']${c.name}["']:`));
+test('controls','loop repeats songs and queues without toggling off on a repeated command',async()=>{
+ const h=harness();try {
+  await h.manager.play(h.interaction('play','First'));await h.manager.play(h.interaction('play','Second'));
+  const q=h.player.getQueue(gid);
+  await h.manager.control(h.interaction('loop','song','other'));assert.equal(q.repeatMode,0);
+  await h.manager.control(h.interaction('loop','song'));await h.manager.control(h.interaction('loop','song'));
+  assert.equal(q.repeatMode,1);assert.equal(h.counts().plays,1);
+  h.voice.stop();await waitFor(()=>h.counts().plays===2);assert.equal(q.songs[0].name,'First');
+  await h.manager.control(h.interaction('loop','queue'));await h.manager.control(h.interaction('loop','queue'));
+  assert.equal(q.repeatMode,2);
+  h.voice.stop();await waitFor(()=>h.counts().plays===3);assert.equal(q.songs[0].name,'Second');
+  h.voice.stop();await waitFor(()=>h.counts().plays===4);assert.equal(q.songs[0].name,'First');
+  const status=h.interaction('loop',null,'other');await h.manager.control(status);assert.match(status.replies.at(-1).content,/Queue/);assert.equal(q.repeatMode,2);
+  await h.manager.control(h.interaction('loop','off'));assert.equal(q.repeatMode,0);
+  h.voice.stop();await waitFor(()=>h.counts().plays===5);h.voice.stop();await waitFor(()=>!h.player.getQueue(gid));
+ }finally{await h.manager.close();}
+});
+
+test('preservation','all 37 commands have handlers and unrelated files remain unchanged',()=>{
+  assert.equal(commandsJSON.length,37);assert.equal(new Set(commandsJSON.map(c=>c.name)).size,37);const index=fs.readFileSync(path.join(root,'index.js'),'utf8');for(const c of commandsJSON)assert.match(index,new RegExp(`case ["']${c.name}["']:`));
   const baseline=JSON.parse(fs.readFileSync(path.join(root,'tests/preserved-sha256.json')));for(const [name,hash] of Object.entries(baseline))assert.equal(createHash('sha256').update(fs.readFileSync(path.join(root,name))).digest('hex'),hash,name);
 });
 

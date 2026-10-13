@@ -235,7 +235,7 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
     if (spotify.has(interaction.guildId)) return spotify.control(interaction);
     if (['stop', 'leave'].includes(interaction.commandName)) return stop(interaction);
     if (!interaction.inGuild()) return interaction.reply({ content: 'Use music commands in the Discord server.', ephemeral: true });
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply(interaction.commandName === 'nowplaying' ? {} : { ephemeral: true });
     const command = interaction.commandName;
     const player = distube;
     const queue = player?.getQueue(interaction.guildId);
@@ -244,7 +244,8 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
     const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
     const isManager = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
     const sameVoice = member?.voice?.channelId && member.voice.channelId === channelId;
-    const isListeningAction = !['queue', 'nowplaying'].includes(command);
+    const loopMode = command === 'loop' ? interaction.options.getString('mode') || 'status' : null;
+    const isListeningAction = !['queue', 'nowplaying'].includes(command) && loopMode !== 'status';
     if (isListeningAction && channelId && !sameVoice && !isManager) {
       return interaction.editReply('Join my voice channel or have **Manage Server** permission.');
     }
@@ -294,6 +295,15 @@ export function createMusicManager(client, { engineFactory, statsFactory = creat
       }
       if (!player || (!queue && !['leave','stop'].includes(command))) return reply('No active song. Use `/play` first.');
       if (!channelId && command !== 'leave') return reply('No voice session is active.');
+      if (command === 'loop') {
+        const modes = { off: 0, song: 1, queue: 2 };
+        if (loopMode !== 'status') {
+          if (!(loopMode in modes)) return reply('Choose Song, Queue / Playlist, Off, or Status.');
+          // DisTube toggles an already-selected mode off, so only set changes.
+          if (queue.repeatMode !== modes[loopMode]) queue.setRepeatMode(modes[loopMode]);
+        }
+        return reply(`🔁 Loop: **${['Off', 'Song', 'Queue'][queue.repeatMode]}**.`);
+      }
       if (command === 'skip' || command === 'next') {
         if (runtime?.pending.has(interaction.guildId)) return reply('The track is still loading. Use `/stop` to cancel it, or try `/skip` after playback starts.');
         const message = await sessions.run(interaction.guildId, async () => {

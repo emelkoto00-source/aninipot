@@ -43,9 +43,9 @@ test('control waits for the matching acknowledgement and refuses unauthenticated
 function fixture() {
   const commands=[],messages=[];
   let watcher,upcoming=[];
-  let playback={status:'paused',is_active:true,item,context:{uri},position:{position_ms:0}};
+  let playback={status:'paused',is_active:true,item,context:{uri},position:{position_ms:0},options:{repeat:'off'}};
   const rt={parec:'fixture',env:{},close:async()=>{},control:{
-    request:async(command,fields={})=>{commands.push([command,fields]);if(command==='get_auth_state')return{logged_in:true};if(command==='get_queue')return{upcoming};if(command==='play')playback={...playback,status:'playing',context:{uri:fields.uri||uri}};if(command==='pause')playback.status='paused';return command==='get_state'?structuredClone(playback):{};},
+    request:async(command,fields={})=>{commands.push([command,fields]);if(command==='get_auth_state')return{logged_in:true};if(command==='get_queue')return{upcoming};if(command==='play')playback={...playback,status:'playing',context:{uri:fields.uri||uri}};if(command==='pause')playback.status='paused';if(command==='set_repeat_track')playback.options.repeat=fields.enabled?'track':'off';if(command==='set_repeat_context')playback.options.repeat=fields.enabled?'context':'off';return command==='get_state'?structuredClone(playback):{};},
     watch:cb=>{watcher=cb;return()=>{};}
   }};
   const channel={id:'voice',permissionsFor:()=>({has:()=>true})};
@@ -92,6 +92,36 @@ test('Spotify playlists append in order, wait through context tracks, then repla
 test('existing YouTube queue blocks Spotify without sending playback commands',async()=>{
   const f=fixture(),m=createSpotifyManager({}, {runtimeFactory:async()=>f.rt,voiceApi:f.api});
   await m.play(f.interaction(),{legacyBusy:()=>true});assert.equal(f.commands.length,0);assert.equal(m.has('guild'),false);
+});
+
+test('Spotify loop modes serialize, report actual state, enforce access, and leave audio running',async()=>{
+ const f=fixture(),m=createSpotifyManager({}, {runtimeFactory:async()=>f.rt,voiceApi:f.api,spawnImpl:()=>f.audio});
+ try {
+  await m.play(f.interaction());f.commands.length=0;
+  await m.control(f.interaction('song','loop','other'));assert.equal(f.commands.length,0);
+  await Promise.all([m.control(f.interaction('song','loop')),m.control(f.interaction('queue','loop'))]);
+  assert.deepEqual(f.commands.filter(([c])=>c.startsWith('set_repeat')), [['set_repeat_context',{enabled:false}],['set_repeat_track',{enabled:true}],['set_repeat_track',{enabled:false}],['set_repeat_context',{enabled:true}]]);
+  assert.match(f.messages.at(-1).content,/Current playlist/);
+  f.commands.length=0;
+  await m.control(f.interaction(null,'loop','other'));assert.match(f.messages.at(-1).content,/Current playlist/);
+  assert.deepEqual(f.commands.map(([c])=>c),['get_state']);
+  await m.control(f.interaction('off','loop'));assert.match(f.messages.at(-1).content,/Off/);
+  assert.equal(f.commands.some(([c])=>['play','pause','skip_next'].includes(c)),false);
+  assert.equal(m.has('guild'),true);
+ }finally{await m.close();}
+});
+
+test('Spotify nowplaying reports paused progress and avoids stale idle metadata',async()=>{
+ const f=fixture(),m=createSpotifyManager({}, {runtimeFactory:async()=>f.rt,voiceApi:f.api,spawnImpl:()=>f.audio});
+ try {
+  await m.play(f.interaction());f.setState({status:'paused',position:{position_ms:65000}});
+  const interaction=f.interaction(null,'nowplaying','other');let deferred;interaction.deferReply=async options=>{deferred=options;};
+  await m.control(interaction);assert.deepEqual(deferred,{},'nowplaying must be public');
+  const embed=f.messages.at(-1).embeds[0].toJSON();
+  assert.match(embed.title,/Paused/);assert.match(embed.description,/1:05 \/ 2:56/);assert.match(embed.description,/Baby 123/);
+  f.setState({status:'idle'});await m.control(f.interaction(null,'nowplaying'));
+  assert.match(f.messages.at(-1).content,/Nothing is playing/);
+ }finally{await m.close();}
 });
 test('stop during startup prevents later voice or playback dispatch',async()=>{
   const f=fixture();let release;const gate=new Promise(r=>release=r);

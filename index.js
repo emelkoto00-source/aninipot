@@ -404,7 +404,8 @@ client.on("interactionCreate", async interaction => {
           "`/skip` or `/next` — Skip a song",
           "`/pause` / `/resume` — Pause or resume",
           "`/queue [page]` — View queued songs",
-          "`/nowplaying` — Display current track",
+          "`/nowplaying` — Display current track and progress",
+          "`/loop [song|queue|off|status]` — Repeat a song or queue / Spotify playlist",
           "`/autoplay <on|off|status>` — Auto next-song suggestions",
           "`/247 <on|off|status>` — Keep voice connected when idle",
           "`/volume <level>` — Adjust volume",
@@ -446,6 +447,7 @@ client.on("interactionCreate", async interaction => {
       case 'pause':
       case 'resume':
       case 'volume':
+      case 'loop':
       case 'nowplaying': {
         await music.control(interaction);
         break;

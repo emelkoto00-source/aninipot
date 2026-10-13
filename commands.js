@@ -159,7 +159,11 @@ export const commandBuilders = [
   new SlashCommandBuilder().setName('resume').setDescription('Resume paused music.'),
   new SlashCommandBuilder().setName('queue').setDescription('Show the current music queue.')
     .addIntegerOption(option => option.setName('page').setDescription('Queue page').setMinValue(1).setRequired(false)),
-  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the song that is playing.'),
+  new SlashCommandBuilder().setName('nowplaying').setDescription('Show the current song and playback progress.'),
+  new SlashCommandBuilder().setName('loop').setDescription('Repeat the current song or queue / Spotify playlist.')
+    .addStringOption(option => option.setName('mode').setDescription('Loop mode (defaults to Status)').setRequired(false)
+      .addChoices({ name: 'Song', value: 'song' }, { name: 'Queue / Playlist', value: 'queue' },
+        { name: 'Off', value: 'off' }, { name: 'Status', value: 'status' })),
   new SlashCommandBuilder().setName('autoplay').setDescription('Control automatic next-song recommendations.')
     .addStringOption(option => option.setName('mode').setDescription('Autoplay mode').setRequired(true)
       .addChoices({ name: 'On', value: 'on' }, { name: 'Off', value: 'off' }, { name: 'Status', value: 'status' })),
