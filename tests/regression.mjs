@@ -16,6 +16,9 @@ process.env.DATA_DIR = path.join(tmp, 'engine');
 process.env.BEBOT_DATA_DIR = path.join(tmp, 'stats');
 process.env.YTDLP_PATH = '/not-used/offline-fixture';
 process.env.YOUTUBE_FALLBACK = 'off';
+// Offline fixtures must not inherit private authentication from the deployment.
+delete process.env.YOUTUBE_COOKIES;
+delete process.env.COOKIES_FILE;
 const require = createRequire(import.meta.url);
 const dt = require('distube');
 const { StreamRelay } = require('../beatra_engine/src/music/relay.js');
@@ -389,6 +392,19 @@ test('announcements','playlist and repeated track announce at each new start',as
     h.player.getQueue(gid).setRepeatMode(1);h.voice.stop();await waitFor(()=>sent.length===3);
     assert.equal(sent[1].embeds[0].data.description,sent[2].embeds[0].data.description);
   } finally {await h.manager.close();}
+});
+test('announcements','a second YouTube playlist appends after all tracks of the first without restarting audio',async()=>{
+ const h=harness({resolve:name=>new dt.Playlist({source:'youtube',name,songs:[song(name+' one'),song(name+' two','bbbbbbbbbbb')]})});
+ try {
+  await h.manager.play(h.interaction('play','Playlist A'));
+  const first=h.player.getQueue(gid).songs[0];
+  await h.manager.play(h.interaction('play','Playlist B'));
+  assert.equal(h.counts().plays,1);assert.equal(h.player.getQueue(gid).songs[0],first);
+  assert.deepEqual(h.player.getQueue(gid).songs.map(s=>s.name),['Playlist A one','Playlist A two','Playlist B one','Playlist B two']);
+  h.voice.stop();await waitFor(()=>h.counts().plays===2);
+  h.voice.stop();await waitFor(()=>h.counts().plays===3);
+  assert.equal(h.player.getQueue(gid).songs[0].name,'Playlist B one');
+ }finally{await h.manager.close();}
 });
 test('announcements','autoplay successor announces without another request',async()=>{
   const h=harness(),sent=[];
