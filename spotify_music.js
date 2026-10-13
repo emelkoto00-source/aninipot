@@ -263,17 +263,50 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
   }
 
   async function control(interaction) {
-    await interaction.deferReply({ flags: 64 });
+    await interaction.deferReply(interaction.commandName === 'nowplaying' ? {} : { flags: 64 });
     const session = active;
     if (!session || session.guildId !== interaction.guildId) return reply(interaction, 'No Spotify session is active.');
     const command = interaction.commandName;
-    if (!['queue', 'nowplaying'].includes(command)) {
+    const loopMode = command === 'loop' ? interaction.options.getString('mode') || 'status' : null;
+    if (!['queue', 'nowplaying'].includes(command) && loopMode !== 'status') {
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (member?.voice?.channelId !== session.voiceId && !isManager(interaction)) return reply(interaction, 'Join my voice channel or have **Manage Server** permission.');
     }
     try {
       if (['stop', 'leave'].includes(command)) { await end(session); return reply(interaction, '⏹️ Stopped Spotify and disconnected.'); }
       if (starting === session) return reply(interaction, 'Spotify is still loading. Use `/stop` to cancel.');
+      if (command === 'loop') {
+        const modes = { off: 'off', song: 'track', queue: 'context' };
+        if (loopMode !== 'status' && !(loopMode in modes)) return reply(interaction, 'Choose Song, Queue / Playlist, Off, or Status.');
+        // Serialize the two repeat switches so simultaneous commands cannot mix modes.
+        const change = (session.loopTail || Promise.resolve()).catch(() => {}).then(async () => {
+          if (session.closed) throw Error('Session stopped');
+          if (loopMode !== 'status') {
+            const switches = loopMode === 'song'
+              ? [['set_repeat_context', false], ['set_repeat_track', true]]
+              : [['set_repeat_track', false], ['set_repeat_context', loopMode === 'queue']];
+            for (const [command, enabled] of switches) {
+              if (session.closed) throw Error('Session stopped');
+              await runtime.control.request(command, { enabled });
+            }
+          }
+          const deadline = Date.now() + 3000;
+          let state;
+          do {
+            if (session.closed) throw Error('Session stopped');
+            state = await runtime.control.request('get_state');
+            if (loopMode === 'status' || state.options?.repeat === modes[loopMode]) break;
+            await new Promise(r => setTimeout(r, 150));
+          } while (Date.now() < deadline);
+          if (session.closed) throw Error('Session stopped');
+          if (loopMode !== 'status' && state.options?.repeat !== modes[loopMode]) return 'Spotify has not confirmed the loop change yet. Check `/loop status`.';
+          const label = { off: 'Off', track: 'Song', context: 'Current playlist / album' }[state.options?.repeat];
+          if (!label) return 'Spotify loop status is unavailable. Try again shortly.';
+          return `🔁 Loop: **${label}**.${state.options.repeat === 'context' ? ' Later playlists wait until you turn loop off.' : ''}`;
+        });
+        session.loopTail = change;
+        return reply(interaction, await change);
+      }
       if (command === 'pause' || command === 'resume') {
         await runtime.control.request(command === 'pause' ? 'pause' : 'play');
         await update(session);
@@ -290,7 +323,8 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
       if (command === 'volume') { const volume = Math.max(0, Math.min(100, interaction.options.getInteger('level', true))); await runtime.control.request('set_volume', { volume }); return reply(interaction, `🔊 Volume set to **${volume}%**.`); }
       if (command === 'nowplaying') {
         const s = await runtime.control.request('get_state');
-        return interaction.editReply({ embeds: [buildNowPlayingEmbed({ paused: s.status === 'paused', currentTime: spotifyPosition(s) }, spotifySong(s.item, session.song?.metadata?.requesterId))], allowedMentions: { parse: [] } });
+        if (!s.item?.uri || s.status === 'idle') return reply(interaction, 'Nothing is playing right now.');
+        return interaction.editReply({ embeds: [buildNowPlayingEmbed({ paused: s.status === 'paused', buffering: s.status === 'buffering', currentTime: spotifyPosition(s) }, spotifySong(s.item, session.song?.metadata?.requesterId))], allowedMentions: { parse: [] } });
       }
       if (command === 'queue') {
         const q = await runtime.control.request('get_queue', { limit: 0 });
