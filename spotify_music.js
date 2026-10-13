@@ -279,7 +279,14 @@ export function createSpotifyManager(client, { runtimeFactory, voiceApi, spawnIm
         await update(session);
         return reply(interaction, command === 'pause' ? '⏸️ Paused playback.' : '▶️ Resumed playback.');
       }
-      if (command === 'skip' || command === 'next') { await runtime.control.request('skip_next'); announcements.stop(session.guildId, '⏭ Skipped'); await update(session); return reply(interaction, '⏭️ Skipped to the next Spotify track.'); }
+      if (command === 'skip' || command === 'next') {
+        const previous = session.lastUri;
+        await runtime.control.request('skip_next');
+        // A track event may already have installed the next card before the acknowledgement.
+        if (session.lastUri === previous) announcements.stop(session.guildId, '⏭ Skipped');
+        await update(session);
+        return reply(interaction, '⏭️ Skipped to the next Spotify track.');
+      }
       if (command === 'volume') { const volume = Math.max(0, Math.min(100, interaction.options.getInteger('level', true))); await runtime.control.request('set_volume', { volume }); return reply(interaction, `🔊 Volume set to **${volume}%**.`); }
       if (command === 'nowplaying') {
         const s = await runtime.control.request('get_state');
